@@ -40,3 +40,37 @@ Comandos: `/cola` (volver a mostrar el menú), `/cancelar` (vaciar la cola), `/s
 - Grupos ofrecidos: por defecto solo aquellos donde sos creador o admin. Con `SOLO_GRUPOS_PROPIOS=0` aparecen todos los grupos en los que podés escribir. Si el grupo tiene Temas, después de elegirlo aparece un segundo menú para elegir el tema (con "↩️ Otro grupo" para volver).
 - Mientras se sube un lote, podés seguir armando el siguiente: queda en cola y arranca al terminar el actual.
 - Logs en `logs/bot.log`.
+
+## Despliegue en una VPS (Oracle Cloud free tier)
+
+Pensado para una VM Ubuntu con usuario `ubuntu`. El bot usa su propio venv, separado del de cloneToTelegram.
+
+1. Clonar y crear el venv (requiere Python 3.10+):
+   ```bash
+   cd ~
+   git clone https://github.com/leoarroyovera/raterinBot.git
+   cd raterinBot
+   sudo apt install -y python3-venv   # si `python3 -m venv` falla
+   python3 -m venv venv
+   venv/bin/pip install -r requirements.txt
+   ```
+2. Copiar el `.env` desde tu PC (no está en el repo):
+   ```powershell
+   scp -i <tu_llave.key> .env ubuntu@<IP_VM>:~/raterinBot/
+   ```
+3. Login de tu cuenta en la VM: `venv/bin/python login.py`. Alternativa: copiar `ratero_user.session` por `scp`, pero en ese caso no correr el bot en la PC y en la VM a la vez con la misma sesión. En cualquier caso, detené el bot en la PC: dos procesos con el mismo token se pisan los mensajes.
+4. Instalar el servicio systemd (ajustar `User` y rutas en `raterinbot.service` si tu VM es distinta):
+   ```bash
+   sudo cp raterinbot.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now raterinbot
+   sudo systemctl status raterinbot
+   ```
+   Logs: `journalctl -u raterinbot -f` o `tail -f logs/bot.log`.
+
+Para actualizar:
+```bash
+cd ~/raterinBot && git pull && venv/bin/pip install -r requirements.txt && sudo systemctl restart raterinbot
+```
+
+Los archivos se descargan temporalmente en `tmp/` antes de subirse; para archivos de varios GB revisar el espacio libre con `df -h`.
