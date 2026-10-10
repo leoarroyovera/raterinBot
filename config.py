@@ -29,3 +29,15 @@ LOG_DIR = "logs"
 # Segundos sin recibir nada nuevo antes de preguntar a que grupo enviar.
 BATCH_DEBOUNCE_S = 2.5
 DESTS_PER_PAGE = 8
+
+# Modo por defecto para lotes de mas de un archivo: "separado" (un mensaje
+# por archivo) o "zip" (un ZIP con todo + album con las imagenes). Se puede
+# cambiar desde el bot con /modo; ese cambio se guarda en SETTINGS_PATH y
+# tiene prioridad sobre este valor.
+DEFAULT_GROUP_MODE = os.environ.get("MODO_GRUPO", "separado").strip().lower()
+SETTINGS_PATH = "settings.json"
+
+# Tamano maximo de cada ZIP en MiB (limite de subida de Telegram: 2000 para
+# cuentas normales, 4000 para Premium). Si el lote lo supera se parte en
+# varios ZIP.
+ZIP_MAX_MB = int(os.environ.get("ZIP_MAX_MB", "2000"))

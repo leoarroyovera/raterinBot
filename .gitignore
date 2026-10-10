@@ -5,3 +5,4 @@ tmp/
 logs/
 __pycache__/
 *.pyc
+settings.json

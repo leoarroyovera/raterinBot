@@ -4,6 +4,8 @@ import os
 import shutil
 import time
 import uuid
+import zipfile
+from datetime import datetime
 from pathlib import Path
 
 from telethon import errors
@@ -13,6 +15,10 @@ import config
 from fast_upload import upload_file_fast
 
 MAX_CAPTION = 1024
+ALBUM_SIZE = 10  # maximo de fotos por album en Telegram
+MAX_PHOTO_BYTES = 10 * 1024 * 1024  # mayores no se aceptan como foto
+# Margen por archivo para cabeceras ZIP/ZIP64 al calcular el tamano de cada parte.
+ZIP_ENTRY_OVERHEAD = 1024
 
 
 def has_file(msg) -> bool:
@@ -143,5 +149,159 @@ async def transfer(dl_client, up_client, msg, dest, reporter: Reporter, topic_id
             if caption:
                 await safe_run(up_client.send_message, dest, caption, reply_to=topic_id)
         return path.name
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# ---------- modo ZIP ----------
+
+
+def is_album_image(msg) -> bool:
+    """Fotos, e imagenes JPG/PNG enviadas como archivo que Telegram aceptaria
+    como foto (para publicarlas en el album)."""
+    if msg.photo:
+        return True
+    doc = msg.document
+    return bool(doc and doc.mime_type in ("image/jpeg", "image/png") and doc.size <= MAX_PHOTO_BYTES)
+
+
+def _unique_arcname(name: str, used: set) -> str:
+    stem, ext = os.path.splitext(name)
+    candidate, n = name, 1
+    while candidate.lower() in used:
+        n += 1
+        candidate = f"{stem} ({n}){ext}"
+    used.add(candidate.lower())
+    return candidate
+
+
+def build_zips(files: list[Path], out_dir: str, base_name: str, max_bytes: int) -> list[Path]:
+    """Empaqueta `files` (en orden) en uno o mas ZIP sin compresion (los
+    archivos multimedia ya vienen comprimidos), partiendo cuando una parte
+    superaria `max_bytes`. Es bloqueante: llamar con asyncio.to_thread."""
+    groups, current, size = [], [], 0
+    for f in files:
+        fsize = f.stat().st_size + ZIP_ENTRY_OVERHEAD
+        if current and size + fsize > max_bytes:
+            groups.append(current)
+            current, size = [], 0
+        current.append(f)
+        size += fsize
+    if current:
+        groups.append(current)
+
+    zips = []
+    for i, group in enumerate(groups, 1):
+        suffix = f"_parte{i}" if len(groups) > 1 else ""
+        zip_path = Path(out_dir) / f"{base_name}{suffix}.zip"
+        used = set()
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for f in group:
+                zf.write(f, arcname=_unique_arcname(f.name, used))
+        zips.append(zip_path)
+    return zips
+
+
+def _zip_caption(names: list[str], part: int, parts: int) -> str:
+    head = f"🗜️ {len(names)} archivo(s)"
+    if parts > 1:
+        head += f" — parte {part}/{parts}"
+    lines = [head, ""]
+    for name in names:
+        lines.append(f"• {name}")
+    caption = "\n".join(lines)
+    if len(caption) > MAX_CAPTION:
+        caption = caption[: MAX_CAPTION - 1] + "…"
+    return caption
+
+
+async def _send_album(up_client, dest, images, topic_id):
+    """Publica las imagenes de a ALBUM_SIZE por post, conservando el caption
+    de cada una."""
+    for start in range(0, len(images), ALBUM_SIZE):
+        chunk = images[start:start + ALBUM_SIZE]
+        captions, entities = [], []
+        for msg, _ in chunk:
+            caption, ents = msg.message or "", list(msg.entities or [])
+            if len(caption) > MAX_CAPTION:
+                caption, ents = caption[: MAX_CAPTION - 1] + "…", []
+            captions.append(caption)
+            entities.append(ents)
+        files = [str(path) for _, path in chunk]
+        try:
+            await safe_run(up_client.send_file, dest, files, caption=captions,
+                           formatting_entities=entities, reply_to=topic_id)
+        except (errors.PhotoSaveFileInvalidError, errors.PhotoInvalidDimensionsError):
+            # Alguna imagen no se acepto como foto: se mandan como documentos
+            # (Telegram las muestra como mensajes sueltos, no como album).
+            await safe_run(up_client.send_file, dest, files, caption=captions,
+                           formatting_entities=entities, reply_to=topic_id,
+                           force_document=True)
+
+
+async def transfer_zipped(entries, up_client, dest, status_msg, title, topic_id=None):
+    """Modo ZIP: descarga todos los mensajes de `entries` [(dl_client, msg,
+    label)], sube un ZIP con todos los archivos (partido si excede
+    config.ZIP_MAX_MB) y ademas publica las imagenes como album.
+    Devuelve (resumen, lista de fallos)."""
+    work_dir = os.path.join(config.TMP_DIR, uuid.uuid4().hex)
+    os.makedirs(work_dir, exist_ok=True)
+    total = len(entries)
+    downloaded, failed = [], []
+    try:
+        for i, (dl_client, msg, label) in enumerate(entries, 1):
+            reporter = Reporter(status_msg, f"🗜️ {title} — {i}/{total}: {label}")
+            await reporter.set("iniciando…", force=True)
+            # Una carpeta por archivo: evita que dos con el mismo nombre se pisen.
+            item_dir = os.path.join(work_dir, str(i))
+            os.makedirs(item_dir, exist_ok=True)
+            try:
+                msg, path = await _download(dl_client, msg, item_dir, reporter.callback("⬇️ descargando"))
+                if not path:
+                    raise RuntimeError("la descarga no devolvio archivo")
+                downloaded.append((msg, Path(path)))
+            except Exception as e:
+                failed.append(f"{label}: {e}")
+
+        if not downloaded:
+            return f"❌ No se pudo descargar ningún archivo para {title}", failed
+
+        reporter = Reporter(status_msg, f"🗜️ {title}")
+        await reporter.set(f"comprimiendo {len(downloaded)} archivo(s)…", force=True)
+        base_name = "archivos_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+        zips = await asyncio.to_thread(build_zips, [p for _, p in downloaded], work_dir,
+                                       base_name, config.ZIP_MAX_MB * 1024 * 1024)
+
+        zips_ok = 0
+        for j, zip_path in enumerate(zips, 1):
+            with zipfile.ZipFile(zip_path) as zf:
+                names = zf.namelist()
+            reporter = Reporter(status_msg, f"🗜️ {title} — {zip_path.name} ({j}/{len(zips)})")
+            try:
+                handle = await safe_run(upload_file_fast, up_client, zip_path,
+                                        progress_callback=reporter.callback("⬆️ subiendo"))
+                await safe_run(up_client.send_file, dest, handle,
+                               caption=_zip_caption(names, j, len(zips)), parse_mode=None,
+                               reply_to=topic_id, file_size=zip_path.stat().st_size,
+                               force_document=True)
+                zips_ok += 1
+            except Exception as e:
+                failed.append(f"{zip_path.name}: {e}")
+
+        images = [(m, p) for m, p in downloaded if is_album_image(m)]
+        album_note = ""
+        if images:
+            await reporter.set(f"publicando álbum de {len(images)} imagen(es)…", force=True)
+            try:
+                await _send_album(up_client, dest, images, topic_id)
+                album_note = f" + álbum de {len(images)} imagen(es)"
+            except Exception as e:
+                failed.append(f"álbum de imágenes: {e}")
+
+        zips_note = "ZIP" if len(zips) == 1 else f"{zips_ok}/{len(zips)} ZIP"
+        summary = f"✅ {zips_note} con {len(downloaded)}/{total} archivo(s){album_note} → {title}"
+        if zips_ok == 0:
+            summary = f"❌ No se pudo subir el ZIP a {title}" + (" (sí el álbum)" if album_note else "")
+        return summary, failed
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -9,7 +10,7 @@ from telethon.tl.types import Channel, Chat
 import config
 from links import fetch_link_messages, parse_links
 from topics import GENERAL_TOPIC_ID, is_forum, list_topics
-from transfer import Reporter, has_file, transfer
+from transfer import Reporter, has_file, transfer, transfer_zipped
 
 LOG_PATH = os.path.join(config.LOG_DIR, "bot.log")
 
@@ -39,15 +40,42 @@ class Batch:
     # Supergrupo con temas elegido, a la espera de que se elija el tema.
     dest_id: int | None = None
     topics: list[tuple[int, str]] = field(default_factory=list)
+    # True: un ZIP con todo + album de imagenes; False: un mensaje por archivo.
+    # Solo aplica con mas de un archivo.
+    zip_mode: bool = False
 
 
 class RateroBot:
     def __init__(self, bot: TelegramClient, user: TelegramClient):
         self.bot = bot
         self.user = user
-        self.batch = Batch()
+        self.zip_default = self._load_zip_default()
+        self.batch = self._new_batch()
         self.process_lock = asyncio.Lock()
         self.dest_entities = {}
+
+    # ---------- modo de envio (separado / zip) ----------
+
+    @staticmethod
+    def _load_zip_default() -> bool:
+        mode = config.DEFAULT_GROUP_MODE
+        try:
+            with open(config.SETTINGS_PATH, "r", encoding="utf-8") as f:
+                mode = json.load(f).get("group_mode", mode)
+        except (FileNotFoundError, ValueError):
+            pass
+        return mode == "zip"
+
+    def _save_zip_default(self) -> None:
+        with open(config.SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"group_mode": "zip" if self.zip_default else "separado"}, f)
+
+    def _new_batch(self) -> Batch:
+        return Batch(zip_mode=self.zip_default)
+
+    @staticmethod
+    def _mode_label(zip_mode: bool) -> str:
+        return "🗜️ ZIP + álbum de imágenes" if zip_mode else "📄 mensajes separados"
 
     # ---------- recepcion ----------
 
@@ -123,16 +151,18 @@ class RateroBot:
             lines.append(f"  {i}. {it.label}")
         if len(batch.items) > 15:
             lines.append(f"  … y {len(batch.items) - 15} más")
+        if len(batch.items) > 1:
+            lines.append(f"\nModo: {self._mode_label(batch.zip_mode)}")
         lines.append(f"\n{question}")
         return "\n".join(lines)
 
     def _dest_buttons(self, batch: Batch, page: int):
-        return self._paged_buttons(batch.dests, page, select="d", nav="p")
+        return self._paged_buttons(batch, batch.dests, page, select="d", nav="p")
 
     def _topic_buttons(self, batch: Batch, page: int):
-        return self._paged_buttons(batch.topics, page, select="t", nav="tp", back=True)
+        return self._paged_buttons(batch, batch.topics, page, select="t", nav="tp", back=True)
 
-    def _paged_buttons(self, entries, page, select, nav, back=False):
+    def _paged_buttons(self, batch, entries, page, select, nav, back=False):
         per = config.DESTS_PER_PAGE
         chunk = entries[page * per:(page + 1) * per]
         rows = [[Button.inline(title[:60], f"{select}:{key}".encode())] for key, title in chunk]
@@ -143,6 +173,10 @@ class RateroBot:
             nav_row.append(Button.inline("▶️", f"{nav}:{page + 1}".encode()))
         if nav_row:
             rows.append(nav_row)
+        if len(batch.items) > 1:
+            other = "🗜️ Enviar como ZIP" if not batch.zip_mode else "📄 Enviar separados"
+            # El menu y la pagina viajan en el callback para no perder la posicion.
+            rows.append([Button.inline(f"Cambiar a: {other}", f"m:{nav}:{page}".encode())])
         last = [Button.inline("❌ Cancelar", b"x")]
         if back:
             last.insert(0, Button.inline("↩️ Otro grupo", b"b"))
@@ -180,11 +214,21 @@ class RateroBot:
 
         if data == "x":
             n = len(batch.items)
-            self.batch = Batch()
+            self.batch = self._new_batch()
             await event.edit(f"Cancelado. Descarté {n} archivo(s).")
             return
         if data.startswith("p:"):
             await event.edit(buttons=self._dest_buttons(batch, int(data[2:])))
+            return
+        if data.startswith("m:"):
+            _, nav, page = data.split(":")
+            batch.zip_mode = not batch.zip_mode
+            if nav == "tp":
+                title = dict(batch.dests).get(batch.dest_id, str(batch.dest_id))
+                await event.edit(self._prompt_text(batch, f"Grupo: {title}\n¿En qué tema?"),
+                                 buttons=self._topic_buttons(batch, int(page)))
+            else:
+                await event.edit(self._prompt_text(batch), buttons=self._dest_buttons(batch, int(page)))
             return
         if data.startswith("tp:"):
             await event.edit(buttons=self._topic_buttons(batch, int(data[3:])))
@@ -214,9 +258,10 @@ class RateroBot:
 
     async def _start_send(self, event, batch: Batch, dest_id: int, title: str, topic_id=None):
         # A partir de aca lo que llegue va a una cola nueva.
-        self.batch = Batch()
+        self.batch = self._new_batch()
         await event.answer(f"Enviando a {title}")
-        await event.edit(f"📤 {len(batch.items)} archivo(s) → {title}", buttons=None)
+        mode = f" ({self._mode_label(batch.zip_mode)})" if len(batch.items) > 1 else ""
+        await event.edit(f"📤 {len(batch.items)} archivo(s) → {title}{mode}", buttons=None)
         # El tema General no admite reply_to: se publica sin tema.
         reply_to = None if topic_id in (None, GENERAL_TOPIC_ID) else topic_id
         asyncio.create_task(self._process(batch, dest_id, title, reply_to))
@@ -228,6 +273,9 @@ class RateroBot:
         async with self.process_lock:
             dest = self.dest_entities.get(dest_id) or await self.user.get_entity(dest_id)
             total = len(batch.items)
+            if batch.zip_mode and total > 1:
+                await self._process_zip(batch, dest, dest_id, title, topic_id, status)
+                return
             ok, failed = 0, []
             _log(f"INICIO {total} archivo(s) -> {title} ({dest_id})")
             for i, item in enumerate(batch.items, 1):
@@ -248,6 +296,20 @@ class RateroBot:
             _log(f"FIN {ok}/{total} -> {title}")
             await status.edit(summary)
 
+    async def _process_zip(self, batch: Batch, dest, dest_id: int, title: str, topic_id, status):
+        _log(f"INICIO ZIP {len(batch.items)} archivo(s) -> {title} ({dest_id})")
+        entries = [(self.bot if it.source == "bot" else self.user, it.msg, it.label) for it in batch.items]
+        try:
+            summary, failed = await transfer_zipped(entries, self.user, dest, status, title, topic_id)
+        except Exception as e:
+            summary, failed = f"❌ Error enviando ZIP a {title}", [str(e)]
+        for f in failed:
+            _log(f"  ERROR {f}")
+        _log(f"FIN ZIP -> {title}: {summary}")
+        if failed:
+            summary += "\n\n❌ Fallaron:\n" + "\n".join(failed)
+        await status.edit(summary)
+
     # ---------- comandos ----------
 
     async def on_start(self, event):
@@ -256,8 +318,28 @@ class RateroBot:
             "de mensajes t.me/... — uno o varios. Cuando dejes de mandar, te "
             "pregunto a qué grupo subirlos y van todos al mismo.\n\n"
             "/cola — ver lo que hay en cola\n"
-            "/cancelar — vaciar la cola"
+            "/cancelar — vaciar la cola\n"
+            "/modo [zip|separado] — cómo enviar varios archivos juntos "
+            f"(ahora: {self._mode_label(self.zip_default)})"
         )
+
+    async def on_mode(self, event):
+        arg = (event.pattern_match.group(1) or "").strip().lower()
+        if arg in ("zip", "comprimido"):
+            self.zip_default = True
+        elif arg in ("separado", "separados"):
+            self.zip_default = False
+        elif not arg:
+            self.zip_default = not self.zip_default
+        else:
+            await event.respond("Uso: /modo zip | /modo separado (sin argumento alterna)")
+            return
+        self._save_zip_default()
+        await event.respond(f"Modo por defecto para varios archivos: {self._mode_label(self.zip_default)}")
+        # La cola en armado adopta el nuevo modo y se refresca su menu.
+        if self.batch.items:
+            self.batch.zip_mode = self.zip_default
+            self._schedule_prompt()
 
     async def on_queue(self, event):
         if not self.batch.items:
@@ -274,7 +356,7 @@ class RateroBot:
                 await self.batch.prompt_msg.delete()
             except Exception:
                 pass
-        self.batch = Batch()
+        self.batch = self._new_batch()
         await event.respond(f"Cola vaciada ({n} archivo(s) descartados).")
 
     def register(self):
@@ -285,6 +367,8 @@ class RateroBot:
             from_users=config.OWNER_ID, pattern=r"^/cola\b"))
         self.bot.add_event_handler(self.on_cancel, events.NewMessage(
             from_users=config.OWNER_ID, pattern=r"^/cancelar\b"))
+        self.bot.add_event_handler(self.on_mode, events.NewMessage(
+            from_users=config.OWNER_ID, pattern=r"^/modo\b(.*)"))
         self.bot.add_event_handler(self.on_message, owner)
         self.bot.add_event_handler(
             self.on_callback, events.CallbackQuery(func=lambda e: e.sender_id == config.OWNER_ID))

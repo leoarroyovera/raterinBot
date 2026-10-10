@@ -30,7 +30,21 @@ Bot de Telegram al que le reenviás archivos (fotos, videos, documentos, audio�
 2. Cuando pasan ~2,5 s sin que mandes nada nuevo, el bot te muestra la cola con botones para elegir el grupo destino (paginados). Si seguís mandando cosas, el menú se actualiza.
 3. Tocás el grupo (y el tema, si es un supergrupo con Temas) y el bot sube todo ahí, en orden, mostrando el progreso. Al final te dice cuántos subió y cuáles fallaron.
 
-Comandos: `/cola` (volver a mostrar el menú), `/cancelar` (vaciar la cola), `/start`.
+Comandos: `/cola` (volver a mostrar el menú), `/cancelar` (vaciar la cola), `/modo` (ver abajo), `/start`.
+
+### Varios archivos: separados o en ZIP
+
+Cuando la cola tiene más de un archivo hay dos modos de envío:
+
+- **Separados** (default): un mensaje por archivo, como siempre.
+- **ZIP**: se descargan todos, se sube **un ZIP sin compresión** con todos los archivos y, si en la cola había imágenes, **además** se publican como álbum (hasta 10 por post, cada una con su caption). Si el ZIP superaría `ZIP_MAX_MB` (default 2000 MiB; poné 4000 con Premium) se parte en `..._parte1.zip`, `..._parte2.zip`, etc.
+
+Cómo elegir:
+
+- **Global**: `/modo zip`, `/modo separado`, o `/modo` solo para alternar. Se guarda en `settings.json` y sobrevive reinicios (el valor inicial sale de `MODO_GRUPO` en `.env`).
+- **Solo para este lote**: el menú de grupos muestra el modo actual y un botón *Cambiar a: …* para cambiarlo antes de elegir el destino.
+
+En modo ZIP el espacio temporal en `tmp/` es aproximadamente el doble del tamaño del lote (originales + ZIP).
 
 ## Detalles
 
