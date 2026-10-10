@@ -101,6 +101,15 @@ class ParallelUploader:
     async def _finish(self):
         await asyncio.gather(*(s.disconnect() for s in self.senders))
 
+    async def _abort(self):
+        """Corte por error o cancelacion (p.ej. el usuario detuvo el envio):
+        se descartan las partes en vuelo y se cierran las conexiones igual."""
+        for s in self.senders or []:
+            if s.previous:
+                s.previous.cancel()
+        await asyncio.gather(*(s.sender.disconnect() for s in self.senders or []),
+                             return_exceptions=True)
+
     async def upload(self, path: Path, progress_callback=None):
         file_size = path.stat().st_size
         part_size = int(utils.get_appropriated_part_size(file_size) * 1024)
@@ -112,6 +121,19 @@ class ParallelUploader:
         await self._init(file_id, part_count, is_big)
 
         hash_md5 = hashlib.md5()
+        try:
+            await self._upload_parts(path, part_size, is_big, file_size, hash_md5, progress_callback)
+        except BaseException:
+            await self._abort()
+            raise
+        await self._finish()
+
+        if is_big:
+            return types.InputFileBig(file_id, part_count, path.name)
+        return custom.InputSizedFile(
+            file_id, part_count, path.name, md5=hash_md5, size=file_size)
+
+    async def _upload_parts(self, path, part_size, is_big, file_size, hash_md5, progress_callback):
         done = 0
         with open(path, "rb") as f:
             while True:
@@ -129,12 +151,6 @@ class ParallelUploader:
                 done += sum(len(p) for p in round_parts)
                 if progress_callback:
                     await helpers._maybe_await(progress_callback(done, file_size))
-        await self._finish()
-
-        if is_big:
-            return types.InputFileBig(file_id, part_count, path.name)
-        return custom.InputSizedFile(
-            file_id, part_count, path.name, md5=hash_md5, size=file_size)
 
 
 async def upload_file_fast(client, path: Path, progress_callback=None,

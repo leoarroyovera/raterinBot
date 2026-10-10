@@ -27,15 +27,17 @@ Bot de Telegram al que le reenviás archivos (fotos, videos, documentos, audio�
 1. Mandale al bot, en privado, una o varias de estas cosas:
    - archivos reenviados desde cualquier chat, o enviados directamente;
    - enlaces de mensajes: `t.me/canal/123`, `t.me/c/1234567/123`, con topic (`t.me/c/1234567/5/123`). Se pueden pegar varios en un mismo mensaje.
-2. Cuando pasan ~2,5 s sin que mandes nada nuevo, el bot te muestra la cola con botones para elegir el grupo destino (paginados). Si seguís mandando cosas, el menú se actualiza.
-3. Tocás el grupo (y el tema, si es un supergrupo con Temas) y el bot sube todo ahí, en orden, mostrando el progreso. Al final te dice cuántos subió y cuáles fallaron.
+   - rangos de mensajes: `t.me/canal/100-150` trae todos los mensajes con archivo entre el 100 y el 150 (máximo 500 por rango). En un enlace con topic el rango es por id de mensaje, así que puede incluir mensajes de otros temas.
+2. Cuando pasan ~2,5 s sin que mandes nada nuevo, el bot te muestra la cola con botones para elegir el grupo destino (paginados, con los últimos usados primero, marcados con 🕘). Si seguís mandando cosas, el menú se actualiza.
+3. Antes de elegir, con más de un archivo podés tocar **✂️ Quitar archivos** para sacar algunos de la cola, y en modo ZIP **✏️ Nombre del ZIP** para ponerle nombre (mandá «-» para volver al automático).
+4. Tocás el grupo (y el tema, si es un supergrupo con Temas) y el bot sube todo ahí, en orden, mostrando el progreso. Al final te dice cuántos subió y cuáles fallaron.
 
 Comandos (también disponibles en el botón **Menú** de Telegram y como botones en `/start`):
 
 | Comando | Qué hace |
 |---|---|
 | `/start` | Menú principal con botones (ver cola, vaciar cola, cambiar modo). |
-| `/cola` | Muestra el envío en curso, los envíos en espera (con un botón para cancelar cada uno) y el lote en armado con su menú de destino. |
+| `/cola` | Muestra el envío en curso (con botón para detenerlo), los envíos en espera (con botón para cancelar cada uno) y el lote en armado con su menú de destino. |
 | `/cancelar` | Vacía el lote en armado (el que todavía no tiene destino). |
 | `/modo` | Modo de envío para varios archivos (ver abajo). |
 
@@ -44,7 +46,7 @@ Comandos (también disponibles en el botón **Menú** de Telegram y como botones
 Cuando la cola tiene más de un archivo hay dos modos de envío:
 
 - **Separados** (default): un mensaje por archivo, como siempre.
-- **ZIP**: se descargan todos, se sube **un ZIP sin compresión** con todos los archivos y, si en la cola había imágenes, **además** se publican como álbum (hasta 10 por post, cada una con su caption). Si el ZIP superaría `ZIP_MAX_MB` (default 2000 MiB; poné 4000 con Premium) se parte en `..._parte1.zip`, `..._parte2.zip`, etc.
+- **ZIP**: se descargan todos, se sube **un ZIP sin compresión** con todos los archivos y, si en la cola había imágenes, **además** se publican como álbum (hasta 10 por post, cada una con su caption). Si el ZIP superaría el límite de subida (o `ZIP_MAX_MB`, si lo definís) se parte en `..._parte1.zip`, `..._parte2.zip`, etc.
 
 Cómo elegir:
 
@@ -58,8 +60,11 @@ En modo ZIP el espacio temporal en `tmp/` es aproximadamente el doble del tamañ
 - **Reenvíos**: los descarga el propio bot. **Enlaces**: los resuelve tu cuenta de usuario, así que funcionan con grupos/canales privados de los que seas miembro, incluso con "contenido protegido" (que no permite reenviar).
 - Un enlace a un mensaje que forma parte de un álbum trae el álbum completo; agregale `?single` para traer solo ese mensaje.
 - La subida la hace tu cuenta con varias conexiones en paralelo (`fast_upload.py`, el mismo de cloneToTelegram). La descarga de archivos de 10 MB o más también va en paralelo (`fast_download.py`, 8 conexiones al datacenter donde está el archivo); si falla por cualquier motivo se reintenta con la descarga estándar. Se conservan caption, formato, nombre de archivo, miniatura y metadata de video/audio, y si en origen era foto/video se sube como foto/video (no como documento).
-- Grupos ofrecidos: por defecto solo aquellos donde sos creador o admin. Con `SOLO_GRUPOS_PROPIOS=0` aparecen todos los grupos en los que podés escribir. Si el grupo tiene Temas, después de elegirlo aparece un segundo menú para elegir el tema (con "↩️ Otro grupo" para volver).
-- Mientras se sube un lote, podés seguir armando el siguiente: queda en cola y arranca al terminar el actual. Mientras espera, su mensaje "⏳ En espera" tiene un botón para cancelarlo (también desde `/cola`); una vez que empezó a subirse ya no se puede cancelar.
+- **Descarga y subida a la vez**: en modo separado, mientras se sube un archivo ya se va descargando el siguiente. El mensaje de estado muestra las dos cosas.
+- **Límites**: el límite de subida se detecta solo al arrancar (4000 MiB si tu cuenta es Premium, 2000 si no; se puede forzar con `MAX_UPLOAD_MB`). Los archivos que lo superan se rechazan al mandarlos, sin descargarlos. Antes de cada descarga se revisa que haya espacio libre en disco (dejando `MARGEN_DISCO_MB`, default 200); en modo ZIP se revisa al empezar que entre el doble del lote.
+- Grupos ofrecidos: por defecto solo aquellos donde sos creador o admin. La lista se reutiliza por 10 minutos; tocá **🔄 Actualizar grupos** si acabás de crear o unirte a uno. Con `SOLO_GRUPOS_PROPIOS=0` aparecen todos los grupos en los que podés escribir. Si el grupo tiene Temas, después de elegirlo aparece un segundo menú para elegir el tema (con "↩️ Otro grupo" para volver).
+- Mientras se sube un lote, podés seguir armando el siguiente: queda en cola y arranca al terminar el actual. Mientras espera, su mensaje "⏳ En espera" tiene un botón para cancelarlo (también desde `/cola`).
+- **Detener el envío en curso**: el mensaje de progreso tiene un botón "⛔ Detener este envío" (también en `/cola`). Corta la transferencia en el acto; lo que ya se subió queda, y lo que faltaba (más lo que haya fallado) queda disponible con el botón "🔁 Retomar lo pendiente".
 - **Reintentar fallidos**: si algún archivo falla, el resumen final trae un botón "🔁 Reintentar fallidos (N)" que los vuelve a encolar al mismo grupo/tema y con el mismo modo. En modo ZIP se reintentan los archivos que no se pudieron descargar o los de la parte del ZIP que no se pudo subir.
 - **Reinicios**: la cola en armado, los envíos pendientes (con su progreso) y los botones de reintento se guardan en `queue.json`. Si el bot se reinicia (systemd, VPS, caída), al arrancar avisa y retoma: un envío a medias sigue desde el archivo siguiente al último terminado (el que estaba en curso se vuelve a subir; un ZIP a medias se rehace completo). Los archivos cuyo mensaje original ya no existe se descartan y se informa cuántos.
 - Logs en `logs/bot.log`.

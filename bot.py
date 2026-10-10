@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -12,17 +14,19 @@ from telethon.tl.types import BotCommand, BotCommandScopeDefault, Channel, Chat
 import config
 from links import fetch_link_messages, parse_links
 from topics import GENERAL_TOPIC_ID, is_forum, list_topics
-from transfer import Reporter, has_file, transfer, transfer_zipped
+from transfer import MIB, Board, file_size, has_file, human, prepare, publish, transfer_zipped
 
 LOG_PATH = os.path.join(config.LOG_DIR, "bot.log")
 
 # Se muestran en el boton "Menu" de Telegram junto al campo de texto.
 BOT_COMMANDS = [
     BotCommand("start", "Menú principal y ayuda"),
-    BotCommand("cola", "Ver la cola y cancelar envíos en espera"),
+    BotCommand("cola", "Ver la cola, cancelar o detener envíos"),
     BotCommand("cancelar", "Vaciar la cola en armado"),
     BotCommand("modo", "Alternar modo ZIP / separados (o /modo zip|separado)"),
 ]
+
+ITEMS_PER_PAGE = 8
 
 
 def _log(line: str) -> None:
@@ -31,6 +35,13 @@ def _log(line: str) -> None:
     with open(LOG_PATH, "a", encoding="utf-8") as f:
         f.write(f"[{stamp}] {line}\n")
     print(line)
+
+
+def _clean_zip_name(text: str) -> str:
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", text).strip()
+    if name.lower().endswith(".zip"):
+        name = name[:-4]
+    return name.strip(" .")[:100]
 
 
 @dataclass
@@ -64,6 +75,10 @@ class Batch:
     # True: un ZIP con todo + album de imagenes; False: un mensaje por archivo.
     # Solo aplica con mas de un archivo.
     zip_mode: bool = False
+    # Nombre del ZIP sin extension (None = archivos_<fecha>).
+    zip_name: str | None = None
+    # Se pidio el nombre del ZIP: el proximo texto sin enlaces es el nombre.
+    awaiting_name: bool = False
 
 
 @dataclass
@@ -75,9 +90,12 @@ class Job:
     dest_id: int
     topic_id: int | None
     title: str
+    zip_name: str | None = None
     status_msg: object = None
+    task: asyncio.Task | None = None
     running: bool = False
-    cancelled: bool = False
+    cancelled: bool = False  # cancelado mientras esperaba turno
+    stop_requested: bool = False  # detenido por el usuario mientras se subia
     current: int = 0  # archivo que se esta subiendo (modo separado)
     # Progreso del modo separado, persistido para retomar tras un reinicio.
     done: int = 0
@@ -87,33 +105,38 @@ class Job:
     def to_dict(self) -> dict:
         return {"id": self.id, "items": [it.to_dict() for it in self.items],
                 "zip_mode": self.zip_mode, "dest_id": self.dest_id, "topic_id": self.topic_id,
-                "title": self.title, "done": self.done, "ok": self.ok, "failed": self.failed}
+                "title": self.title, "zip_name": self.zip_name,
+                "done": self.done, "ok": self.ok, "failed": self.failed}
 
 
 @dataclass
 class Retry:
-    """Archivos que fallaron en un envio, listos para reencolar con un boton."""
+    """Archivos que fallaron (o quedaron sin subir) en un envio, listos para
+    reencolar con un boton."""
     id: int
     items: list[Item]
     zip_mode: bool
     dest_id: int
     topic_id: int | None
     title: str
+    zip_name: str | None = None
 
     def to_dict(self) -> dict:
         return {"id": self.id, "items": [it.to_dict() for it in self.items],
                 "zip_mode": self.zip_mode, "dest_id": self.dest_id,
-                "topic_id": self.topic_id, "title": self.title}
+                "topic_id": self.topic_id, "title": self.title, "zip_name": self.zip_name}
 
 
 class RateroBot:
     def __init__(self, bot: TelegramClient, user: TelegramClient):
         self.bot = bot
         self.user = user
-        self.zip_default = self._load_zip_default()
+        self.settings = self._load_settings()
+        self.zip_default = self.settings.get("group_mode", config.DEFAULT_GROUP_MODE) == "zip"
         self.batch = self._new_batch()
         self.process_lock = asyncio.Lock()
         self.dest_entities = {}
+        self._dests_cache: tuple[float, list] | None = None
         self.jobs: list[Job] = []
         self.retries: dict[int, Retry] = {}
         # Un solo contador para jobs y reintentos; se persiste para que los
@@ -121,22 +144,32 @@ class RateroBot:
         self.next_id = 1
         # Mensajes con enlaces que se estan resolviendo (aun no estan en la cola).
         self.resolving = 0
+        # Se ajustan en detect_limits() segun la cuenta de usuario.
+        self.upload_limit = (config.MAX_UPLOAD_MB or 2000) * MIB
+        self.zip_max = (config.ZIP_MAX_MB or config.MAX_UPLOAD_MB or 2000) * MIB
 
-    # ---------- modo de envio (separado / zip) ----------
+    async def detect_limits(self) -> None:
+        me = await self.user.get_me()
+        premium = bool(getattr(me, "premium", False))
+        limit_mb = config.MAX_UPLOAD_MB or (4000 if premium else 2000)
+        self.upload_limit = limit_mb * MIB
+        self.zip_max = (config.ZIP_MAX_MB or limit_mb) * MIB
+        _log(f"Limite de subida: {limit_mb} MiB ({'Premium' if premium else 'cuenta normal'})")
+
+    # ---------- ajustes (modo de envio y grupos recientes) ----------
 
     @staticmethod
-    def _load_zip_default() -> bool:
-        mode = config.DEFAULT_GROUP_MODE
+    def _load_settings() -> dict:
         try:
             with open(config.SETTINGS_PATH, "r", encoding="utf-8") as f:
-                mode = json.load(f).get("group_mode", mode)
+                return json.load(f)
         except (FileNotFoundError, ValueError):
-            pass
-        return mode == "zip"
+            return {}
 
-    def _save_zip_default(self) -> None:
+    def _save_settings(self) -> None:
+        self.settings["group_mode"] = "zip" if self.zip_default else "separado"
         with open(config.SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump({"group_mode": "zip" if self.zip_default else "separado"}, f)
+            json.dump(self.settings, f)
 
     def _new_batch(self) -> Batch:
         return Batch(zip_mode=self.zip_default)
@@ -157,7 +190,7 @@ class RateroBot:
         data = {
             "next_id": self.next_id,
             "batch": {"items": [it.to_dict() for it in self.batch.items],
-                      "zip_mode": self.batch.zip_mode},
+                      "zip_mode": self.batch.zip_mode, "zip_name": self.batch.zip_name},
             "jobs": [j.to_dict() for j in self.jobs],
             "retries": [r.to_dict() for r in self.retries.values()],
         }
@@ -208,6 +241,7 @@ class RateroBot:
         items = await self._load_items(b.get("items", []))
         lost += items.count(None)
         self.batch.zip_mode = b.get("zip_mode", self.zip_default)
+        self.batch.zip_name = b.get("zip_name")
         for it in items:
             if it is not None:
                 self._add(it)
@@ -216,7 +250,7 @@ class RateroBot:
             r_items = [it for it in await self._load_items(r["items"]) if it is not None]
             if r_items:
                 self.retries[r["id"]] = Retry(r["id"], r_items, r["zip_mode"], r["dest_id"],
-                                              r["topic_id"], r["title"])
+                                              r["topic_id"], r["title"], r.get("zip_name"))
 
         pending = []
         for j in data.get("jobs", []):
@@ -244,7 +278,8 @@ class RateroBot:
             await self.bot.send_message(config.OWNER_ID, text)
         for j, j_items, done, ok, failed in pending:
             await self._enqueue(j_items, j["zip_mode"], j["dest_id"], j["topic_id"], j["title"],
-                                done=done, ok=ok, failed=failed, job_id=j["id"])
+                                zip_name=j.get("zip_name"), done=done, ok=ok, failed=failed,
+                                job_id=j["id"])
         self._save_queue()
         if self.batch.items:
             self._schedule_prompt()
@@ -258,16 +293,36 @@ class RateroBot:
         self.batch.items.append(item)
         return True
 
+    def _too_big(self, msg) -> str | None:
+        """Motivo de rechazo si el archivo supera el limite de subida (se
+        avisa al encolarlo, en vez de descargarlo y fallar al final)."""
+        size = file_size(msg)
+        if size > self.upload_limit:
+            return f"pesa {human(size)}, supera el límite de subida ({human(self.upload_limit)})"
+        return None
+
+    @staticmethod
+    def _label(msg) -> str:
+        return msg.file.name or ("foto" if msg.photo else msg.file.mime_type or "archivo")
+
     async def on_message(self, event):
         msg = event.message
         if not has_file(msg) and msg.raw_text.startswith("/"):
             return
 
+        if not has_file(msg) and self.batch.awaiting_name and not parse_links(msg.raw_text):
+            await self._set_zip_name(event, msg.raw_text)
+            return
+
         added = 0
         errors = []
         if has_file(msg):
-            label = msg.file.name or ("foto" if msg.photo else msg.file.mime_type or "archivo")
-            added += self._add(Item("bot", msg, label))
+            label = self._label(msg)
+            reason = self._too_big(msg)
+            if reason:
+                errors.append(f"{label}: {reason}")
+            else:
+                added += self._add(Item("bot", msg, label))
         else:
             links = parse_links(msg.raw_text)
             if not links:
@@ -286,15 +341,30 @@ class RateroBot:
                         errors.append(f"{link.url}: no tiene archivo o no tengo acceso")
                         continue
                     for m in files:
-                        label = m.file.name or ("foto" if m.photo else m.file.mime_type or "archivo")
+                        label = self._label(m)
+                        reason = self._too_big(m)
+                        if reason:
+                            errors.append(f"{label}: {reason}")
+                            continue
                         added += self._add(Item("user", m, label))
             finally:
                 self.resolving -= 1
 
         if errors:
-            await event.reply("No pude agregar:\n" + "\n".join(errors))
+            text = "No pude agregar:\n" + "\n".join(errors)
+            await event.reply(text[:4000])
         if added:
             self._save_queue()
+            self._schedule_prompt()
+
+    async def _set_zip_name(self, event, text: str):
+        self.batch.awaiting_name = False
+        name = _clean_zip_name(text)
+        self.batch.zip_name = None if name in ("", "-") else name
+        self._save_queue()
+        shown = f"{self.batch.zip_name}.zip" if self.batch.zip_name else "automático (archivos_<fecha>.zip)"
+        await event.reply(f"✏️ Nombre del ZIP: {shown}")
+        if self.batch.items:
             self._schedule_prompt()
 
     # ---------- seleccion de destino ----------
@@ -309,7 +379,7 @@ class RateroBot:
         if batch is not self.batch or not batch.items:
             return
         if not batch.dests:
-            batch.dests = await self._list_dests()
+            batch.dests = await self._get_dests()
         if batch.prompt_msg:
             try:
                 await batch.prompt_msg.delete()
@@ -330,16 +400,18 @@ class RateroBot:
             lines.append(f"  … y {len(batch.items) - 15} más")
         if len(batch.items) > 1:
             lines.append(f"\nModo: {self._mode_label(batch.zip_mode)}")
+            if batch.zip_mode:
+                lines.append(f"Nombre: {batch.zip_name or 'archivos_<fecha>'}.zip")
         lines.append(f"\n{question}")
         return "\n".join(lines)
 
     def _dest_buttons(self, batch: Batch, page: int):
-        return self._paged_buttons(batch, batch.dests, page, select="d", nav="p")
+        return self._paged_buttons(batch, batch.dests, page, select="d", nav="p", refresh=True)
 
     def _topic_buttons(self, batch: Batch, page: int):
         return self._paged_buttons(batch, batch.topics, page, select="t", nav="tp", back=True)
 
-    def _paged_buttons(self, batch, entries, page, select, nav, back=False):
+    def _paged_buttons(self, batch, entries, page, select, nav, back=False, refresh=False):
         per = config.DESTS_PER_PAGE
         chunk = entries[page * per:(page + 1) * per]
         rows = [[Button.inline(title[:60], f"{select}:{key}".encode())] for key, title in chunk]
@@ -354,10 +426,32 @@ class RateroBot:
             other = "🗜️ Enviar como ZIP" if not batch.zip_mode else "📄 Enviar separados"
             # El menu y la pagina viajan en el callback para no perder la posicion.
             rows.append([Button.inline(f"Cambiar a: {other}", f"m:{nav}:{page}".encode())])
+            tools = [Button.inline("✂️ Quitar archivos", b"rm:0")]
+            if batch.zip_mode:
+                tools.insert(0, Button.inline("✏️ Nombre del ZIP", b"zn"))
+            rows.append(tools)
         last = [Button.inline("❌ Cancelar", b"x")]
+        if refresh:
+            last.insert(0, Button.inline("🔄 Actualizar grupos", b"rd"))
         if back:
             last.insert(0, Button.inline("↩️ Otro grupo", b"b"))
         rows.append(last)
+        return rows
+
+    def _remove_buttons(self, batch: Batch, page: int):
+        """Un boton por archivo de la cola: tocarlo lo quita."""
+        per = ITEMS_PER_PAGE
+        start = page * per
+        rows = [[Button.inline(f"❌ {i}. {it.label}"[:60], f"ri:{i - 1}:{page}".encode())]
+                for i, it in enumerate(batch.items[start:start + per], start + 1)]
+        nav_row = []
+        if page > 0:
+            nav_row.append(Button.inline("◀️", f"rm:{page - 1}".encode()))
+        if start + per < len(batch.items):
+            nav_row.append(Button.inline("▶️", f"rm:{page + 1}".encode()))
+        if nav_row:
+            rows.append(nav_row)
+        rows.append([Button.inline("✅ Listo", b"b")])
         return rows
 
     async def _list_dests(self) -> list[tuple[int, str]]:
@@ -381,6 +475,27 @@ class RateroBot:
             self.dest_entities[d.id] = e
             (owned if is_owned else others).append((d.id, d.name))
         return owned + others
+
+    async def _get_dests(self, refresh=False) -> list[tuple[int, str]]:
+        """Grupos destino con los usados recientemente primero. La lista de
+        dialogos se reutiliza por DESTS_CACHE_S segundos (recorrerla entera
+        es lento con muchos chats)."""
+        if refresh or not self._dests_cache or time.monotonic() - self._dests_cache[0] > config.DESTS_CACHE_S:
+            self._dests_cache = (time.monotonic(), await self._list_dests())
+        dests = self._dests_cache[1]
+        by_id = dict(dests)
+        recent_ids = [i for i in self.settings.get("recent_dests", []) if i in by_id]
+        recent = [(i, "🕘 " + by_id[i]) for i in recent_ids]
+        return recent + [(i, t) for i, t in dests if i not in recent_ids]
+
+    def _remember_dest(self, dest_id: int) -> None:
+        recent = [i for i in self.settings.get("recent_dests", []) if i != dest_id]
+        self.settings["recent_dests"] = [dest_id, *recent][:config.RECENT_DESTS]
+        self._save_settings()
+
+    @staticmethod
+    def _dest_title(batch: Batch, dest_id) -> str:
+        return dict(batch.dests).get(dest_id, str(dest_id)).removeprefix("🕘 ")
 
     async def on_callback(self, event):
         data = event.data.decode()
@@ -409,16 +524,47 @@ class RateroBot:
         if data.startswith("p:"):
             await event.edit(buttons=self._dest_buttons(batch, int(data[2:])))
             return
+        if data == "rd":
+            await event.answer("Actualizando lista de grupos…")
+            batch.dests = await self._get_dests(refresh=True)
+            await event.edit(self._prompt_text(batch), buttons=self._dest_buttons(batch, 0))
+            return
         if data.startswith("m:"):
             _, nav, page = data.split(":")
             batch.zip_mode = not batch.zip_mode
             self._save_queue()
             if nav == "tp":
-                title = dict(batch.dests).get(batch.dest_id, str(batch.dest_id))
+                title = self._dest_title(batch, batch.dest_id)
                 await event.edit(self._prompt_text(batch, f"Grupo: {title}\n¿En qué tema?"),
                                  buttons=self._topic_buttons(batch, int(page)))
             else:
                 await event.edit(self._prompt_text(batch), buttons=self._dest_buttons(batch, int(page)))
+            return
+        if data == "zn":
+            batch.awaiting_name = True
+            await event.answer()
+            await event.respond("✏️ Escribí el nombre para el ZIP (sin .zip). Mandá «-» para usar el automático.")
+            return
+        if data.startswith("rm:"):
+            await event.edit(self._prompt_text(batch, "Tocá un archivo para quitarlo de la cola:"),
+                             buttons=self._remove_buttons(batch, int(data[3:])))
+            return
+        if data.startswith("ri:"):
+            _, idx, page = data.split(":")
+            idx, page = int(idx), int(page)
+            if 0 <= idx < len(batch.items):
+                item = batch.items.pop(idx)
+                batch.keys.discard(item.key)
+                self._save_queue()
+                await event.answer(f"Quitado: {item.label}"[:200])
+            if not batch.items:
+                self.batch = self._new_batch()
+                self._save_queue()
+                await event.edit("Quitaste todos los archivos: la cola quedó vacía.")
+                return
+            page = min(page, (len(batch.items) - 1) // ITEMS_PER_PAGE)
+            await event.edit(self._prompt_text(batch, "Tocá un archivo para quitarlo de la cola:"),
+                             buttons=self._remove_buttons(batch, page))
             return
         if data.startswith("tp:"):
             await event.edit(buttons=self._topic_buttons(batch, int(data[3:])))
@@ -429,7 +575,7 @@ class RateroBot:
             return
         if data.startswith("d:"):
             dest_id = int(data[2:])
-            title = dict(batch.dests).get(dest_id, str(dest_id))
+            title = self._dest_title(batch, dest_id)
             dest = self.dest_entities.get(dest_id) or await self.user.get_entity(dest_id)
             if is_forum(dest):
                 await event.answer()
@@ -442,24 +588,26 @@ class RateroBot:
             return
         if data.startswith("t:") and batch.dest_id is not None:
             topic_id = int(data[2:])
-            title = dict(batch.dests).get(batch.dest_id, str(batch.dest_id))
+            title = self._dest_title(batch, batch.dest_id)
             title += " › " + dict(batch.topics).get(topic_id, str(topic_id))
             await self._start_send(event, batch, batch.dest_id, title, topic_id)
 
     async def _start_send(self, event, batch: Batch, dest_id: int, title: str, topic_id=None):
         # A partir de aca lo que llegue va a una cola nueva.
         self.batch = self._new_batch()
+        self._remember_dest(dest_id)
         await event.answer(f"Enviando a {title}")
         mode = f" ({self._mode_label(batch.zip_mode)})" if len(batch.items) > 1 else ""
         await event.edit(f"📤 {len(batch.items)} archivo(s) → {title}{mode}", buttons=None)
         # El tema General no admite reply_to: se publica sin tema.
         reply_to = None if topic_id in (None, GENERAL_TOPIC_ID) else topic_id
-        await self._enqueue(batch.items, batch.zip_mode, dest_id, reply_to, title)
+        zip_name = batch.zip_name if batch.zip_mode else None
+        await self._enqueue(batch.items, batch.zip_mode, dest_id, reply_to, title, zip_name=zip_name)
 
-    async def _enqueue(self, items, zip_mode, dest_id, topic_id, title, done=0, ok=0,
-                       failed=None, job_id=None) -> Job:
+    async def _enqueue(self, items, zip_mode, dest_id, topic_id, title, zip_name=None, done=0,
+                       ok=0, failed=None, job_id=None) -> Job:
         job = Job(job_id or self._new_id(), items, zip_mode, dest_id, topic_id, title,
-                  done=done, ok=ok, failed=failed or [])
+                  zip_name=zip_name, done=done, ok=ok, failed=failed or [])
         n = len(items) - done
         job.status_msg = await self.bot.send_message(
             config.OWNER_ID, f"⏳ En espera: {n} archivo(s) → {title}",
@@ -467,75 +615,148 @@ class RateroBot:
         # Se registra ya (no dentro de la tarea) para que /cola lo vea de inmediato.
         self.jobs.append(job)
         self._save_queue()
-        asyncio.create_task(self._process(job))
+        job.task = asyncio.create_task(self._process(job))
         return job
 
     # ---------- procesamiento ----------
 
+    @staticmethod
+    def _stop_buttons(job: Job):
+        return [[Button.inline("⛔ Detener este envío", f"cj:{job.id}".encode())]]
+
+    def _drop_job(self, job: Job) -> None:
+        if job in self.jobs:
+            self.jobs.remove(job)
+            self._save_queue()
+
     async def _process(self, job: Job):
         try:
             await self._process_job(job)
+        except asyncio.CancelledError:
+            if not job.stop_requested:
+                # El bot se esta apagando: el envio queda en queue.json y se
+                # retoma al volver a arrancar.
+                raise
+            await self._finish_stopped(job)
         except Exception as e:
-            # Error fuera de un archivo puntual (p.ej. destino inaccesible):
-            # se reporta y el lote completo queda para reintentar.
+            # Error fuera de un archivo puntual (p.ej. destino inaccesible o
+            # sin espacio): se reporta y el lote completo queda para reintentar.
             _log(f"ERROR envio -> {job.title}: {e!r}")
-            await self._finish(job, f"❌ Error enviando a {job.title}: {e}", [],
-                               list(range(len(job.items))))
-        finally:
-            if job in self.jobs:
-                self.jobs.remove(job)
-                self._save_queue()
+            try:
+                await self._finish(job, f"❌ Error enviando a {job.title}: {e}", [],
+                                   list(range(len(job.items))))
+            except Exception as e2:
+                _log(f"  no pude reportar el error: {e2!r}")
+        self._drop_job(job)
 
     async def _process_job(self, job: Job):
-        title, status = job.title, job.status_msg
         async with self.process_lock:
             if job.cancelled:
                 return
             job.running = True
-            # Ya no se puede cancelar: se quita el boton.
-            await status.edit(f"📤 {title}\niniciando…", buttons=None)
+            await job.status_msg.edit(f"📤 {job.title}\niniciando…", buttons=self._stop_buttons(job))
             dest = self.dest_entities.get(job.dest_id) or await self.user.get_entity(job.dest_id)
-            total = len(job.items)
-            if job.zip_mode and total > 1:
+            if job.zip_mode and len(job.items) > 1:
                 await self._process_zip(job, dest)
-                return
-            _log(f"INICIO {total} archivo(s) -> {title} ({job.dest_id})"
-                 + (f" (retomando desde {job.done + 1})" if job.done else ""))
-            for i, item in enumerate(job.items, 1):
-                if i <= job.done:
-                    continue
+            else:
+                await self._process_separate(job, dest)
+
+    async def _process_separate(self, job: Job, dest):
+        """Un mensaje por archivo. Mientras se sube un archivo ya se va
+        descargando el siguiente, para no tener la red ociosa."""
+        title, total = job.title, len(job.items)
+        board = Board(job.status_msg, f"📤 {title}", self._stop_buttons(job))
+
+        def start_download(i):
+            item = job.items[i - 1]
+            line = board.line("dl", f"⬇️ {i}/{total}: {item.label}")
+            dl_client = self.bot if item.source == "bot" else self.user
+
+            async def run():
+                await line.set("iniciando…", force=True)
+                return await prepare(dl_client, item.msg, line)
+
+            return asyncio.create_task(run())
+
+        _log(f"INICIO {total} archivo(s) -> {title} ({job.dest_id})"
+             + (f" (retomando desde {job.done + 1})" if job.done else ""))
+        next_task = start_download(job.done + 1)
+        prepared = None
+        try:
+            for i in range(job.done + 1, total + 1):
+                item = job.items[i - 1]
                 job.current = i
-                reporter = Reporter(status, f"📤 {title} — {i}/{total}: {item.label}")
-                await reporter.set("iniciando…", force=True)
-                dl_client = self.bot if item.source == "bot" else self.user
+                task, next_task = next_task, None
                 try:
-                    name = await transfer(dl_client, self.user, item.msg, dest, reporter, job.topic_id)
-                    job.ok += 1
-                    _log(f"  OK {name}")
+                    prepared = await task
                 except Exception as e:
                     job.failed.append((i - 1, str(e)))
                     _log(f"  ERROR {item.label}: {e!r}")
+                finally:
+                    board.remove("dl")
+                if i < total:
+                    next_task = start_download(i + 1)
+                if prepared is not None:
+                    try:
+                        name = await publish(self.user, prepared, dest,
+                                             board.line("up", f"⬆️ {i}/{total}: {item.label}"),
+                                             job.topic_id)
+                        job.ok += 1
+                        _log(f"  OK {name}")
+                    except Exception as e:
+                        job.failed.append((i - 1, str(e)))
+                        _log(f"  ERROR {item.label}: {e!r}")
+                    finally:
+                        board.remove("up")
+                        prepared.cleanup()
+                        prepared = None
                 job.done = i
                 self._save_queue()
+        finally:
+            if prepared is not None:
+                prepared.cleanup()
+            if next_task is not None:
+                # Detenido o cortado: se descarta la descarga adelantada.
+                next_task.cancel()
+                try:
+                    leftover = await next_task
+                except BaseException:
+                    pass
+                else:
+                    leftover.cleanup()
 
-            _log(f"FIN {job.ok}/{total} -> {title}")
-            errors = [f"{job.items[idx].label}: {err}" for idx, err in job.failed]
-            await self._finish(job, f"✅ {job.ok}/{total} enviado(s) a {title}", errors,
-                               [idx for idx, _ in job.failed])
+        _log(f"FIN {job.ok}/{total} -> {title}")
+        errors = [f"{job.items[idx].label}: {err}" for idx, err in job.failed]
+        await self._finish(job, f"✅ {job.ok}/{total} enviado(s) a {title}", errors,
+                           [idx for idx, _ in job.failed])
 
     async def _process_zip(self, job: Job, dest):
         _log(f"INICIO ZIP {len(job.items)} archivo(s) -> {job.title} ({job.dest_id})")
         entries = [(self.bot if it.source == "bot" else self.user, it.msg, it.label) for it in job.items]
         summary, errors, failed_idx = await transfer_zipped(
-            entries, self.user, dest, job.status_msg, job.title, job.topic_id)
+            entries, self.user, dest, job.status_msg, job.title, job.topic_id,
+            zip_max_bytes=self.zip_max, base_name=job.zip_name, buttons=self._stop_buttons(job))
         for f in errors:
             _log(f"  ERROR {f}")
         _log(f"FIN ZIP -> {job.title}: {summary}")
         await self._finish(job, summary, errors, failed_idx)
 
-    async def _finish(self, job: Job, summary: str, errors: list[str], failed_idx: list[int]):
-        """Edita el mensaje de estado con el resumen y, si hubo archivos que
-        fallaron, agrega un boton para reintentarlos."""
+    async def _finish_stopped(self, job: Job):
+        total = len(job.items)
+        if job.zip_mode and total > 1:
+            summary = f"⛔ Detenido: el ZIP para {job.title} no se terminó de enviar"
+            pending = list(range(total))
+        else:
+            summary = f"⛔ Detenido: {job.ok}/{total} enviado(s) a {job.title}"
+            pending = sorted({idx for idx, _ in job.failed} | set(range(job.done, total)))
+        _log(f"DETENIDO -> {job.title}: {summary}")
+        errors = [f"{job.items[idx].label}: {err}" for idx, err in job.failed]
+        await self._finish(job, summary, errors, pending, retry_label="🔁 Retomar lo pendiente")
+
+    async def _finish(self, job: Job, summary: str, errors: list[str], failed_idx: list[int],
+                      retry_label="🔁 Reintentar fallidos"):
+        """Edita el mensaje de estado con el resumen y, si quedaron archivos
+        sin subir, agrega un boton para reencolarlos."""
         if errors:
             summary += "\n\n❌ Fallaron:\n" + "\n".join(errors)
         if len(summary) > 4000:  # limite de texto de Telegram (4096)
@@ -543,14 +764,13 @@ class RateroBot:
         buttons = None
         if failed_idx:
             retry = Retry(self._new_id(), [job.items[i] for i in failed_idx], job.zip_mode,
-                          job.dest_id, job.topic_id, job.title)
+                          job.dest_id, job.topic_id, job.title, job.zip_name)
             self.retries[retry.id] = retry
             # Solo se conservan los ultimos reintentos para no crecer sin limite.
             for old in list(self.retries)[:-config.MAX_RETRIES_KEPT]:
                 del self.retries[old]
             self._save_queue()
-            buttons = [[Button.inline(f"🔁 Reintentar fallidos ({len(retry.items)})",
-                                      f"rf:{retry.id}".encode())]]
+            buttons = [[Button.inline(f"{retry_label} ({len(retry.items)})", f"rf:{retry.id}".encode())]]
         await job.status_msg.edit(summary, buttons=buttons)
 
     async def _retry_failed(self, event, retry_id: int):
@@ -558,12 +778,13 @@ class RateroBot:
         if retry is None:
             await event.answer("Ese reintento ya no está disponible.")
             return
-        await event.answer(f"Reintentando {len(retry.items)} archivo(s)")
+        await event.answer(f"Reencolando {len(retry.items)} archivo(s)")
         msg = await event.get_message()
-        await event.edit(msg.text + "\n\n🔁 Reintento encolado.", buttons=None)
-        await self._enqueue(retry.items, retry.zip_mode, retry.dest_id, retry.topic_id, retry.title)
+        await event.edit(msg.text + "\n\n🔁 Reencolado.", buttons=None)
+        await self._enqueue(retry.items, retry.zip_mode, retry.dest_id, retry.topic_id, retry.title,
+                            zip_name=retry.zip_name)
 
-    # ---------- cancelar envios en espera ----------
+    # ---------- cancelar / detener envios ----------
 
     def _queue_view(self):
         """Texto y botones de /cola para los lotes con destino ya elegido, o
@@ -572,8 +793,9 @@ class RateroBot:
         for job in self.jobs:
             n = len(job.items)
             if job.running:
-                prog = f" {job.current}/{n}" if job.current else ""
+                prog = f" {job.current}/{n}" if job.current and not job.zip_mode else ""
                 lines.append(f"📤 Subiendo{prog}: {n} archivo(s) → {job.title}")
+                buttons.append([Button.inline(f"⛔ Detener → {job.title}"[:60], f"cj:{job.id}".encode())])
             else:
                 lines.append(f"⏳ En espera: {n} archivo(s) → {job.title}")
                 buttons.append([Button.inline(f"❌ Cancelar → {job.title}"[:60], f"cj:{job.id}".encode())])
@@ -584,15 +806,20 @@ class RateroBot:
         return "\n".join(lines), buttons or None
 
     async def _cancel_job(self, event, job_id: int):
+        """Cancela un envio en espera, o detiene uno en curso (lo que no se
+        llego a subir queda disponible con el boton de retomar)."""
         job = next((j for j in self.jobs if j.id == job_id), None)
         if job is None:
             await event.answer("Ese envío ya terminó o fue cancelado.")
         elif job.running:
-            await event.answer("Ese envío ya se está subiendo; no se puede cancelar.", alert=True)
+            if not job.stop_requested:
+                job.stop_requested = True
+                job.task.cancel()
+                _log(f"DETENIENDO -> {job.title}")
+            await event.answer("Deteniendo el envío…")
         else:
             job.cancelled = True
-            self.jobs.remove(job)
-            self._save_queue()
+            self._drop_job(job)
             _log(f"CANCELADO {len(job.items)} archivo(s) -> {job.title}")
             await event.answer("Envío cancelado")
             try:
@@ -613,12 +840,14 @@ class RateroBot:
     def _help_text(self) -> str:
         return (
             "Reenviame archivos (fotos, videos, documentos…) o pegame enlaces "
-            "de mensajes t.me/... — uno o varios. Cuando dejes de mandar, te "
-            "pregunto a qué grupo subirlos y van todos al mismo.\n\n"
-            "/cola — ver la cola y cancelar envíos en espera\n"
+            "de mensajes t.me/... — uno o varios, o un rango como "
+            "t.me/canal/100-150. Cuando dejes de mandar, te pregunto a qué "
+            "grupo subirlos y van todos al mismo.\n\n"
+            "/cola — ver la cola, cancelar envíos en espera o detener el actual\n"
             "/cancelar — vaciar la cola en armado\n"
             "/modo [zip|separado] — cómo enviar varios archivos juntos\n\n"
-            f"Modo actual: {self._mode_label(self.zip_default)}"
+            f"Modo actual: {self._mode_label(self.zip_default)}\n"
+            f"Límite de subida: {human(self.upload_limit)}"
         )
 
     def _menu_buttons(self):
@@ -655,7 +884,7 @@ class RateroBot:
             self.zip_default = not self.zip_default
         else:
             return None
-        self._save_zip_default()
+        self._save_settings()
         # La cola en armado adopta el nuevo modo y se refresca su menu.
         if self.batch.items:
             self.batch.zip_mode = self.zip_default
@@ -730,6 +959,7 @@ async def main() -> None:
 
     try:
         ratero = RateroBot(bot, user)
+        await ratero.detect_limits()
         ratero.register()
         _log("Bot iniciado")
         await ratero.restore()

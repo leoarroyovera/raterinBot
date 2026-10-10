@@ -37,10 +37,27 @@ DESTS_PER_PAGE = 8
 DEFAULT_GROUP_MODE = os.environ.get("MODO_GRUPO", "separado").strip().lower()
 SETTINGS_PATH = "settings.json"
 
-# Tamano maximo de cada ZIP en MiB (limite de subida de Telegram: 2000 para
-# cuentas normales, 4000 para Premium). Si el lote lo supera se parte en
-# varios ZIP.
-ZIP_MAX_MB = int(os.environ.get("ZIP_MAX_MB", "2000"))
+# Limite de subida en MiB. Vacio = automatico segun la cuenta de usuario
+# (4000 si es Premium, 2000 si no). Los archivos que lo superan se rechazan
+# al agregarlos a la cola, antes de descargarlos.
+_max_upload = os.environ.get("MAX_UPLOAD_MB", "").strip()
+MAX_UPLOAD_MB = int(_max_upload) if _max_upload else None
+
+# Tamano maximo de cada ZIP en MiB; si el lote lo supera se parte en varios
+# ZIP. Vacio = el limite de subida.
+_zip_max = os.environ.get("ZIP_MAX_MB", "").strip()
+ZIP_MAX_MB = int(_zip_max) if _zip_max else None
+
+# Espacio libre que se deja siempre en disco al descargar (MiB).
+DISK_MARGIN_MB = int(os.environ.get("MARGEN_DISCO_MB", "200"))
+
+# Enlaces con rango (t.me/canal/100-150): cantidad maxima de mensajes.
+MAX_LINK_RANGE = 500
+
+# Grupos destino: cuantos recientes se muestran primero y cuanto tiempo se
+# reutiliza la lista de grupos antes de volver a recorrer los dialogos.
+RECENT_DESTS = 5
+DESTS_CACHE_S = 600
 
 # Cola y envios pendientes, para retomarlos si el bot se reinicia.
 QUEUE_PATH = "queue.json"

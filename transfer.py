@@ -5,6 +5,7 @@ import shutil
 import time
 import uuid
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -22,10 +23,15 @@ ALBUM_SIZE = 10  # maximo de fotos por album en Telegram
 MAX_PHOTO_BYTES = 10 * 1024 * 1024  # mayores no se aceptan como foto
 # Margen por archivo para cabeceras ZIP/ZIP64 al calcular el tamano de cada parte.
 ZIP_ENTRY_OVERHEAD = 1024
+MIB = 1024 * 1024
 
 
 def has_file(msg) -> bool:
     return msg is not None and msg.file is not None and not isinstance(msg.media, MessageMediaWebPage)
+
+
+def file_size(msg) -> int:
+    return (msg.file.size or 0) if has_file(msg) else 0
 
 
 def human(n):
@@ -33,6 +39,15 @@ def human(n):
         if abs(n) < 1024 or unit == "TB":
             return f"{n:.1f}{unit}" if unit != "B" else f"{int(n)}B"
         n /= 1024
+
+
+def ensure_disk_space(needed: int) -> None:
+    """Falla antes de descargar si en TMP_DIR no entran `needed` bytes mas
+    el margen de config.DISK_MARGIN_MB."""
+    os.makedirs(config.TMP_DIR, exist_ok=True)
+    free = shutil.disk_usage(config.TMP_DIR).free
+    if free < needed + config.DISK_MARGIN_MB * MIB:
+        raise RuntimeError(f"sin espacio en disco: necesito {human(needed)} y hay {human(free)} libres")
 
 
 async def safe_run(coro_fn, *args, max_retries=5, **kwargs):
@@ -45,39 +60,73 @@ async def safe_run(coro_fn, *args, max_retries=5, **kwargs):
     raise RuntimeError(f"Excedido max_retries ({max_retries}) tras FloodWait repetido")
 
 
-class Reporter:
-    """Edita un mensaje de estado del bot con el progreso, como mucho una
-    vez cada `interval` segundos para no chocar con FloodWait."""
+def _progress_callback(setter, verb):
+    start = time.monotonic()
 
-    def __init__(self, status_msg, header, interval=4.0):
+    async def cb(done, total):
+        span = max(time.monotonic() - start, 1e-6)
+        pct = f" ({done * 100 / total:.0f}%)" if total else ""
+        await setter(f"{verb}: {human(done)} / {human(total or 0)}{pct} a {human(done / span)}/s")
+
+    return cb
+
+
+class Board:
+    """Mensaje de estado del bot con varias lineas que se actualizan por
+    separado (p.ej. la descarga del siguiente archivo y la subida del actual
+    a la vez). Edita como mucho una vez cada `interval` segundos para no
+    chocar con FloodWait, y conserva los `buttons` en cada edicion."""
+
+    def __init__(self, status_msg, header, buttons=None, interval=4.0):
         self.status_msg = status_msg
         self.header = header
+        self.buttons = buttons
         self.interval = interval
+        self.lines = {}
         self.last = 0.0
         self.last_text = None
 
-    async def set(self, text, force=False):
+    async def render(self, force=False):
         now = time.monotonic()
         if not force and now - self.last < self.interval:
             return
-        full = f"{self.header}\n{text}"
+        full = "\n\n".join([self.header, *self.lines.values()])
         if full == self.last_text:
             return
         self.last, self.last_text = now, full
         try:
-            await self.status_msg.edit(full)
+            await self.status_msg.edit(full, buttons=self.buttons)
         except (errors.MessageNotModifiedError, errors.FloodWaitError):
             pass
 
+    def line(self, key, label) -> "BoardLine":
+        return BoardLine(self, key, label)
+
+    def remove(self, key):
+        self.lines.pop(key, None)
+
+
+class BoardLine:
+    def __init__(self, board: Board, key, label):
+        self.board, self.key, self.label = board, key, label
+
+    async def set(self, text, force=False):
+        self.board.lines[self.key] = f"{self.label}\n{text}"
+        await self.board.render(force)
+
     def callback(self, verb):
-        start = time.monotonic()
+        return _progress_callback(self.set, verb)
 
-        async def cb(done, total):
-            span = max(time.monotonic() - start, 1e-6)
-            pct = f" ({done * 100 / total:.0f}%)" if total else ""
-            await self.set(f"{verb}: {human(done)} / {human(total or 0)}{pct} a {human(done / span)}/s")
 
-        return cb
+class Reporter(BoardLine):
+    """Estado de una sola linea con encabezado (atajo sobre Board)."""
+
+    def __init__(self, status_msg, header, buttons=None, interval=4.0):
+        super().__init__(Board(status_msg, header, buttons, interval), "main", "")
+
+    async def set(self, text, force=False):
+        self.board.lines["main"] = text
+        await self.board.render(force)
 
 
 async def _refetch(client, msg):
@@ -130,56 +179,78 @@ def _is_media_type(msg) -> bool:
     return bool(msg.photo or msg.video or msg.gif or msg.audio or msg.voice or msg.video_note)
 
 
-async def transfer(dl_client, up_client, msg, dest, reporter: Reporter, topic_id=None):
-    """Descarga `msg` con `dl_client` y lo sube a `dest` con `up_client`.
-    `topic_id` es el tema destino en supergrupos con modo Foro (None = General)."""
+# ---------- modo separado: descarga y subida por separado ----------
+
+
+@dataclass
+class Prepared:
+    """Archivo ya descargado, listo para subir."""
+    msg: object
+    path: Path
+    thumb: str | None
+    work_dir: str
+
+    def cleanup(self):
+        shutil.rmtree(self.work_dir, ignore_errors=True)
+
+
+async def prepare(dl_client, msg, reporter) -> Prepared:
+    """Descarga `msg` (y su miniatura) con `dl_client` a una carpeta propia.
+    Separado de publish() para poder bajar el siguiente archivo mientras se
+    sube el actual."""
+    ensure_disk_space(file_size(msg))
     work_dir = os.path.join(config.TMP_DIR, uuid.uuid4().hex)
     os.makedirs(work_dir, exist_ok=True)
     try:
         msg, path = await _download(dl_client, msg, work_dir, reporter.callback("⬇️ descargando"))
         if not path:
             raise RuntimeError("la descarga no devolvio archivo")
-        path = Path(path)
-
         thumb = None
         if msg.document and msg.document.thumbs:
             try:
                 thumb = await dl_client.download_media(msg, file=os.path.join(work_dir, "thumb.jpg"), thumb=-1)
             except Exception:
                 thumb = None
-
-        handle = await safe_run(upload_file_fast, up_client, path,
-                                progress_callback=reporter.callback("⬆️ subiendo"))
-
-        caption = msg.message or ""
-        entities = msg.entities
-        if len(caption) > MAX_CAPTION:
-            caption, entities = caption[: MAX_CAPTION - 1] + "…", None
-
-        kwargs = dict(caption=caption, formatting_entities=entities, reply_to=topic_id,
-                      file_size=path.stat().st_size,
-                      force_document=not _is_media_type(msg))
-        if msg.document:
-            # Copiar atributos originales conserva nombre, duracion,
-            # dimensiones de video, artista/titulo de audio, etc.
-            kwargs["attributes"] = list(msg.document.attributes)
-            kwargs["mime_type"] = msg.document.mime_type
-            kwargs["thumb"] = thumb
-            if msg.video:
-                kwargs["supports_streaming"] = True
-        try:
-            await safe_run(up_client.send_file, dest, handle, **kwargs)
-        except (errors.PhotoSaveFileInvalidError, errors.PhotoInvalidDimensionsError):
-            kwargs["force_document"] = True
-            await safe_run(up_client.send_file, dest, handle, **kwargs)
-        except errors.MediaCaptionTooLongError:
-            kwargs["caption"], kwargs["formatting_entities"] = "", None
-            await safe_run(up_client.send_file, dest, handle, **kwargs)
-            if caption:
-                await safe_run(up_client.send_message, dest, caption, reply_to=topic_id)
-        return path.name
-    finally:
+        return Prepared(msg, Path(path), thumb, work_dir)
+    except BaseException:
         shutil.rmtree(work_dir, ignore_errors=True)
+        raise
+
+
+async def publish(up_client, prep: Prepared, dest, reporter, topic_id=None) -> str:
+    """Sube un archivo ya descargado a `dest` con `up_client`. `topic_id` es
+    el tema destino en supergrupos con modo Foro (None = General)."""
+    msg, path = prep.msg, prep.path
+    handle = await safe_run(upload_file_fast, up_client, path,
+                            progress_callback=reporter.callback("⬆️ subiendo"))
+
+    caption = msg.message or ""
+    entities = msg.entities
+    if len(caption) > MAX_CAPTION:
+        caption, entities = caption[: MAX_CAPTION - 1] + "…", None
+
+    kwargs = dict(caption=caption, formatting_entities=entities, reply_to=topic_id,
+                  file_size=path.stat().st_size,
+                  force_document=not _is_media_type(msg))
+    if msg.document:
+        # Copiar atributos originales conserva nombre, duracion,
+        # dimensiones de video, artista/titulo de audio, etc.
+        kwargs["attributes"] = list(msg.document.attributes)
+        kwargs["mime_type"] = msg.document.mime_type
+        kwargs["thumb"] = prep.thumb
+        if msg.video:
+            kwargs["supports_streaming"] = True
+    try:
+        await safe_run(up_client.send_file, dest, handle, **kwargs)
+    except (errors.PhotoSaveFileInvalidError, errors.PhotoInvalidDimensionsError):
+        kwargs["force_document"] = True
+        await safe_run(up_client.send_file, dest, handle, **kwargs)
+    except errors.MediaCaptionTooLongError:
+        kwargs["caption"], kwargs["formatting_entities"] = "", None
+        await safe_run(up_client.send_file, dest, handle, **kwargs)
+        if caption:
+            await safe_run(up_client.send_message, dest, caption, reply_to=topic_id)
+    return path.name
 
 
 # ---------- modo ZIP ----------
@@ -269,11 +340,15 @@ async def _send_album(up_client, dest, images, topic_id):
                            force_document=True)
 
 
-async def transfer_zipped(entries, up_client, dest, status_msg, title, topic_id=None):
+async def transfer_zipped(entries, up_client, dest, status_msg, title, topic_id=None,
+                          zip_max_bytes=2000 * MIB, base_name=None, buttons=None):
     """Modo ZIP: descarga todos los mensajes de `entries` [(dl_client, msg,
     label)], sube un ZIP con todos los archivos (partido si excede
-    config.ZIP_MAX_MB) y ademas publica las imagenes como album.
+    `zip_max_bytes`) y ademas publica las imagenes como album. `base_name` es
+    el nombre del ZIP sin extension (default archivos_<fecha>).
     Devuelve (resumen, lista de fallos, indices de `entries` a reintentar)."""
+    # Originales + ZIP: hace falta mas o menos el doble del lote.
+    ensure_disk_space(2 * sum(file_size(msg) for _, msg, _ in entries))
     work_dir = os.path.join(config.TMP_DIR, uuid.uuid4().hex)
     os.makedirs(work_dir, exist_ok=True)
     total = len(entries)
@@ -282,7 +357,7 @@ async def transfer_zipped(entries, up_client, dest, status_msg, title, topic_id=
     try:
         for i, (dl_client, msg, label) in enumerate(entries, 1):
             idx = i - 1
-            reporter = Reporter(status_msg, f"🗜️ {title} — {i}/{total}: {label}")
+            reporter = Reporter(status_msg, f"🗜️ {title} — {i}/{total}: {label}", buttons)
             await reporter.set("iniciando…", force=True)
             # Una carpeta por archivo: evita que dos con el mismo nombre se pisen.
             item_dir = os.path.join(work_dir, str(i))
@@ -300,17 +375,17 @@ async def transfer_zipped(entries, up_client, dest, status_msg, title, topic_id=
         if not downloaded:
             return f"❌ No se pudo descargar ningún archivo para {title}", failed, failed_idx
 
-        reporter = Reporter(status_msg, f"🗜️ {title}")
+        reporter = Reporter(status_msg, f"🗜️ {title}", buttons)
         await reporter.set(f"comprimiendo {len(downloaded)} archivo(s)…", force=True)
-        base_name = "archivos_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_name = base_name or "archivos_" + datetime.now().strftime("%Y%m%d_%H%M%S")
         zips = await asyncio.to_thread(build_zips, [p for _, p in downloaded], work_dir,
-                                       base_name, config.ZIP_MAX_MB * 1024 * 1024)
+                                       base_name, zip_max_bytes)
 
         zips_ok = 0
         for j, (zip_path, group) in enumerate(zips, 1):
             with zipfile.ZipFile(zip_path) as zf:
                 names = zf.namelist()
-            reporter = Reporter(status_msg, f"🗜️ {title} — {zip_path.name} ({j}/{len(zips)})")
+            reporter = Reporter(status_msg, f"🗜️ {title} — {zip_path.name} ({j}/{len(zips)})", buttons)
             try:
                 handle = await safe_run(upload_file_fast, up_client, zip_path,
                                         progress_callback=reporter.callback("⬆️ subiendo"))
