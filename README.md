@@ -57,9 +57,11 @@ En modo ZIP el espacio temporal en `tmp/` es aproximadamente el doble del tamañ
 
 - **Reenvíos**: los descarga el propio bot. **Enlaces**: los resuelve tu cuenta de usuario, así que funcionan con grupos/canales privados de los que seas miembro, incluso con "contenido protegido" (que no permite reenviar).
 - Un enlace a un mensaje que forma parte de un álbum trae el álbum completo; agregale `?single` para traer solo ese mensaje.
-- La subida la hace tu cuenta con varias conexiones en paralelo (`fast_upload.py`, el mismo de cloneToTelegram). Se conservan caption, formato, nombre de archivo, miniatura y metadata de video/audio, y si en origen era foto/video se sube como foto/video (no como documento).
+- La subida la hace tu cuenta con varias conexiones en paralelo (`fast_upload.py`, el mismo de cloneToTelegram). La descarga de archivos de 10 MB o más también va en paralelo (`fast_download.py`, 8 conexiones al datacenter donde está el archivo); si falla por cualquier motivo se reintenta con la descarga estándar. Se conservan caption, formato, nombre de archivo, miniatura y metadata de video/audio, y si en origen era foto/video se sube como foto/video (no como documento).
 - Grupos ofrecidos: por defecto solo aquellos donde sos creador o admin. Con `SOLO_GRUPOS_PROPIOS=0` aparecen todos los grupos en los que podés escribir. Si el grupo tiene Temas, después de elegirlo aparece un segundo menú para elegir el tema (con "↩️ Otro grupo" para volver).
 - Mientras se sube un lote, podés seguir armando el siguiente: queda en cola y arranca al terminar el actual. Mientras espera, su mensaje "⏳ En espera" tiene un botón para cancelarlo (también desde `/cola`); una vez que empezó a subirse ya no se puede cancelar.
+- **Reintentar fallidos**: si algún archivo falla, el resumen final trae un botón "🔁 Reintentar fallidos (N)" que los vuelve a encolar al mismo grupo/tema y con el mismo modo. En modo ZIP se reintentan los archivos que no se pudieron descargar o los de la parte del ZIP que no se pudo subir.
+- **Reinicios**: la cola en armado, los envíos pendientes (con su progreso) y los botones de reintento se guardan en `queue.json`. Si el bot se reinicia (systemd, VPS, caída), al arrancar avisa y retoma: un envío a medias sigue desde el archivo siguiente al último terminado (el que estaba en curso se vuelve a subir; un ZIP a medias se rehace completo). Los archivos cuyo mensaje original ya no existe se descartan y se informa cuántos.
 - Logs en `logs/bot.log`.
 
 ## Despliegue en una VPS (Oracle Cloud free tier)

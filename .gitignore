@@ -6,3 +6,5 @@ logs/
 __pycache__/
 *.pyc
 settings.json
+queue.json
+queue.json.tmp

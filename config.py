@@ -41,3 +41,8 @@ SETTINGS_PATH = "settings.json"
 # cuentas normales, 4000 para Premium). Si el lote lo supera se parte en
 # varios ZIP.
 ZIP_MAX_MB = int(os.environ.get("ZIP_MAX_MB", "2000"))
+
+# Cola y envios pendientes, para retomarlos si el bot se reinicia.
+QUEUE_PATH = "queue.json"
+# Cuantos botones de "Reintentar fallidos" se mantienen activos.
+MAX_RETRIES_KEPT = 20
