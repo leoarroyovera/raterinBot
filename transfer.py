@@ -95,8 +95,9 @@ def _is_media_type(msg) -> bool:
     return bool(msg.photo or msg.video or msg.gif or msg.audio or msg.voice or msg.video_note)
 
 
-async def transfer(dl_client, up_client, msg, dest, reporter: Reporter):
-    """Descarga `msg` con `dl_client` y lo sube a `dest` con `up_client`."""
+async def transfer(dl_client, up_client, msg, dest, reporter: Reporter, topic_id=None):
+    """Descarga `msg` con `dl_client` y lo sube a `dest` con `up_client`.
+    `topic_id` es el tema destino en supergrupos con modo Foro (None = General)."""
     work_dir = os.path.join(config.TMP_DIR, uuid.uuid4().hex)
     os.makedirs(work_dir, exist_ok=True)
     try:
@@ -120,7 +121,7 @@ async def transfer(dl_client, up_client, msg, dest, reporter: Reporter):
         if len(caption) > MAX_CAPTION:
             caption, entities = caption[: MAX_CAPTION - 1] + "…", None
 
-        kwargs = dict(caption=caption, formatting_entities=entities,
+        kwargs = dict(caption=caption, formatting_entities=entities, reply_to=topic_id,
                       file_size=path.stat().st_size,
                       force_document=not _is_media_type(msg))
         if msg.document:
@@ -140,7 +141,7 @@ async def transfer(dl_client, up_client, msg, dest, reporter: Reporter):
             kwargs["caption"], kwargs["formatting_entities"] = "", None
             await safe_run(up_client.send_file, dest, handle, **kwargs)
             if caption:
-                await safe_run(up_client.send_message, dest, caption)
+                await safe_run(up_client.send_message, dest, caption, reply_to=topic_id)
         return path.name
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)

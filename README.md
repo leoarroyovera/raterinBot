@@ -28,7 +28,7 @@ Bot de Telegram al que le reenviás archivos (fotos, videos, documentos, audio�
    - archivos reenviados desde cualquier chat, o enviados directamente;
    - enlaces de mensajes: `t.me/canal/123`, `t.me/c/1234567/123`, con topic (`t.me/c/1234567/5/123`). Se pueden pegar varios en un mismo mensaje.
 2. Cuando pasan ~2,5 s sin que mandes nada nuevo, el bot te muestra la cola con botones para elegir el grupo destino (paginados). Si seguís mandando cosas, el menú se actualiza.
-3. Tocás el grupo y el bot sube todo ahí, en orden, mostrando el progreso. Al final te dice cuántos subió y cuáles fallaron.
+3. Tocás el grupo (y el tema, si es un supergrupo con Temas) y el bot sube todo ahí, en orden, mostrando el progreso. Al final te dice cuántos subió y cuáles fallaron.
 
 Comandos: `/cola` (volver a mostrar el menú), `/cancelar` (vaciar la cola), `/start`.
 
@@ -37,6 +37,6 @@ Comandos: `/cola` (volver a mostrar el menú), `/cancelar` (vaciar la cola), `/s
 - **Reenvíos**: los descarga el propio bot. **Enlaces**: los resuelve tu cuenta de usuario, así que funcionan con grupos/canales privados de los que seas miembro, incluso con "contenido protegido" (que no permite reenviar).
 - Un enlace a un mensaje que forma parte de un álbum trae el álbum completo; agregale `?single` para traer solo ese mensaje.
 - La subida la hace tu cuenta con varias conexiones en paralelo (`fast_upload.py`, el mismo de cloneToTelegram). Se conservan caption, formato, nombre de archivo, miniatura y metadata de video/audio, y si en origen era foto/video se sube como foto/video (no como documento).
-- Grupos ofrecidos: por defecto solo aquellos donde sos creador o admin. Con `SOLO_GRUPOS_PROPIOS=0` aparecen todos los grupos en los que podés escribir. Si el grupo tiene Temas, se publica en "General".
+- Grupos ofrecidos: por defecto solo aquellos donde sos creador o admin. Con `SOLO_GRUPOS_PROPIOS=0` aparecen todos los grupos en los que podés escribir. Si el grupo tiene Temas, después de elegirlo aparece un segundo menú para elegir el tema (con "↩️ Otro grupo" para volver).
 - Mientras se sube un lote, podés seguir armando el siguiente: queda en cola y arranca al terminar el actual.
 - Logs en `logs/bot.log`.

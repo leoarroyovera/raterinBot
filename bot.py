@@ -8,6 +8,7 @@ from telethon.tl.types import Channel, Chat
 
 import config
 from links import fetch_link_messages, parse_links
+from topics import GENERAL_TOPIC_ID, is_forum, list_topics
 from transfer import Reporter, has_file, transfer
 
 LOG_PATH = os.path.join(config.LOG_DIR, "bot.log")
@@ -35,6 +36,9 @@ class Batch:
     prompt_msg: object = None
     prompt_task: asyncio.Task | None = None
     dests: list[tuple[int, str]] = field(default_factory=list)
+    # Supergrupo con temas elegido, a la espera de que se elija el tema.
+    dest_id: int | None = None
+    topics: list[tuple[int, str]] = field(default_factory=list)
 
 
 class RateroBot:
@@ -113,27 +117,36 @@ class RateroBot:
         batch.prompt_msg = await self.bot.send_message(
             config.OWNER_ID, self._prompt_text(batch), buttons=self._dest_buttons(batch, 0))
 
-    def _prompt_text(self, batch: Batch) -> str:
+    def _prompt_text(self, batch: Batch, question="¿A qué grupo los envío?") -> str:
         lines = [f"📦 {len(batch.items)} archivo(s) en cola:"]
         for i, it in enumerate(batch.items[:15], 1):
             lines.append(f"  {i}. {it.label}")
         if len(batch.items) > 15:
             lines.append(f"  … y {len(batch.items) - 15} más")
-        lines.append("\n¿A qué grupo los envío?")
+        lines.append(f"\n{question}")
         return "\n".join(lines)
 
     def _dest_buttons(self, batch: Batch, page: int):
+        return self._paged_buttons(batch.dests, page, select="d", nav="p")
+
+    def _topic_buttons(self, batch: Batch, page: int):
+        return self._paged_buttons(batch.topics, page, select="t", nav="tp", back=True)
+
+    def _paged_buttons(self, entries, page, select, nav, back=False):
         per = config.DESTS_PER_PAGE
-        chunk = batch.dests[page * per:(page + 1) * per]
-        rows = [[Button.inline(title[:60], f"d:{dest_id}".encode())] for dest_id, title in chunk]
-        nav = []
+        chunk = entries[page * per:(page + 1) * per]
+        rows = [[Button.inline(title[:60], f"{select}:{key}".encode())] for key, title in chunk]
+        nav_row = []
         if page > 0:
-            nav.append(Button.inline("◀️", f"p:{page - 1}".encode()))
-        if (page + 1) * per < len(batch.dests):
-            nav.append(Button.inline("▶️", f"p:{page + 1}".encode()))
-        if nav:
-            rows.append(nav)
-        rows.append([Button.inline("❌ Cancelar", b"x")])
+            nav_row.append(Button.inline("◀️", f"{nav}:{page - 1}".encode()))
+        if (page + 1) * per < len(entries):
+            nav_row.append(Button.inline("▶️", f"{nav}:{page + 1}".encode()))
+        if nav_row:
+            rows.append(nav_row)
+        last = [Button.inline("❌ Cancelar", b"x")]
+        if back:
+            last.insert(0, Button.inline("↩️ Otro grupo", b"b"))
+        rows.append(last)
         return rows
 
     async def _list_dests(self) -> list[tuple[int, str]]:
@@ -173,18 +186,44 @@ class RateroBot:
         if data.startswith("p:"):
             await event.edit(buttons=self._dest_buttons(batch, int(data[2:])))
             return
+        if data.startswith("tp:"):
+            await event.edit(buttons=self._topic_buttons(batch, int(data[3:])))
+            return
+        if data == "b":
+            batch.dest_id, batch.topics = None, []
+            await event.edit(self._prompt_text(batch), buttons=self._dest_buttons(batch, 0))
+            return
         if data.startswith("d:"):
             dest_id = int(data[2:])
             title = dict(batch.dests).get(dest_id, str(dest_id))
-            # A partir de aca lo que llegue va a una cola nueva.
-            self.batch = Batch()
-            await event.answer(f"Enviando a {title}")
-            await event.edit(f"📤 {len(batch.items)} archivo(s) → {title}", buttons=None)
-            asyncio.create_task(self._process(batch, dest_id, title))
+            dest = self.dest_entities.get(dest_id) or await self.user.get_entity(dest_id)
+            if is_forum(dest):
+                await event.answer()
+                batch.dest_id = dest_id
+                batch.topics = await list_topics(self.user, dest)
+                await event.edit(self._prompt_text(batch, f"Grupo: {title}\n¿En qué tema?"),
+                                 buttons=self._topic_buttons(batch, 0))
+                return
+            await self._start_send(event, batch, dest_id, title)
+            return
+        if data.startswith("t:") and batch.dest_id is not None:
+            topic_id = int(data[2:])
+            title = dict(batch.dests).get(batch.dest_id, str(batch.dest_id))
+            title += " › " + dict(batch.topics).get(topic_id, str(topic_id))
+            await self._start_send(event, batch, batch.dest_id, title, topic_id)
+
+    async def _start_send(self, event, batch: Batch, dest_id: int, title: str, topic_id=None):
+        # A partir de aca lo que llegue va a una cola nueva.
+        self.batch = Batch()
+        await event.answer(f"Enviando a {title}")
+        await event.edit(f"📤 {len(batch.items)} archivo(s) → {title}", buttons=None)
+        # El tema General no admite reply_to: se publica sin tema.
+        reply_to = None if topic_id in (None, GENERAL_TOPIC_ID) else topic_id
+        asyncio.create_task(self._process(batch, dest_id, title, reply_to))
 
     # ---------- procesamiento ----------
 
-    async def _process(self, batch: Batch, dest_id: int, title: str):
+    async def _process(self, batch: Batch, dest_id: int, title: str, topic_id=None):
         status = await self.bot.send_message(config.OWNER_ID, "⏳ En espera…")
         async with self.process_lock:
             dest = self.dest_entities.get(dest_id) or await self.user.get_entity(dest_id)
@@ -196,7 +235,7 @@ class RateroBot:
                 await reporter.set("iniciando…", force=True)
                 dl_client = self.bot if item.source == "bot" else self.user
                 try:
-                    name = await transfer(dl_client, self.user, item.msg, dest, reporter)
+                    name = await transfer(dl_client, self.user, item.msg, dest, reporter, topic_id)
                     ok += 1
                     _log(f"  OK {name}")
                 except Exception as e:
