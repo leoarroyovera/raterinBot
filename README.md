@@ -30,7 +30,14 @@ Bot de Telegram al que le reenviás archivos (fotos, videos, documentos, audio�
 2. Cuando pasan ~2,5 s sin que mandes nada nuevo, el bot te muestra la cola con botones para elegir el grupo destino (paginados). Si seguís mandando cosas, el menú se actualiza.
 3. Tocás el grupo (y el tema, si es un supergrupo con Temas) y el bot sube todo ahí, en orden, mostrando el progreso. Al final te dice cuántos subió y cuáles fallaron.
 
-Comandos: `/cola` (volver a mostrar el menú), `/cancelar` (vaciar la cola), `/modo` (ver abajo), `/start`.
+Comandos (también disponibles en el botón **Menú** de Telegram y como botones en `/start`):
+
+| Comando | Qué hace |
+|---|---|
+| `/start` | Menú principal con botones (ver cola, vaciar cola, cambiar modo). |
+| `/cola` | Muestra el envío en curso, los envíos en espera (con un botón para cancelar cada uno) y el lote en armado con su menú de destino. |
+| `/cancelar` | Vacía el lote en armado (el que todavía no tiene destino). |
+| `/modo` | Modo de envío para varios archivos (ver abajo). |
 
 ### Varios archivos: separados o en ZIP
 
@@ -52,7 +59,7 @@ En modo ZIP el espacio temporal en `tmp/` es aproximadamente el doble del tamañ
 - Un enlace a un mensaje que forma parte de un álbum trae el álbum completo; agregale `?single` para traer solo ese mensaje.
 - La subida la hace tu cuenta con varias conexiones en paralelo (`fast_upload.py`, el mismo de cloneToTelegram). Se conservan caption, formato, nombre de archivo, miniatura y metadata de video/audio, y si en origen era foto/video se sube como foto/video (no como documento).
 - Grupos ofrecidos: por defecto solo aquellos donde sos creador o admin. Con `SOLO_GRUPOS_PROPIOS=0` aparecen todos los grupos en los que podés escribir. Si el grupo tiene Temas, después de elegirlo aparece un segundo menú para elegir el tema (con "↩️ Otro grupo" para volver).
-- Mientras se sube un lote, podés seguir armando el siguiente: queda en cola y arranca al terminar el actual.
+- Mientras se sube un lote, podés seguir armando el siguiente: queda en cola y arranca al terminar el actual. Mientras espera, su mensaje "⏳ En espera" tiene un botón para cancelarlo (también desde `/cola`); una vez que empezó a subirse ya no se puede cancelar.
 - Logs en `logs/bot.log`.
 
 ## Despliegue en una VPS (Oracle Cloud free tier)

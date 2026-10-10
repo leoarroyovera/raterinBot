@@ -1,11 +1,14 @@
 import asyncio
+import itertools
 import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from telethon import Button, TelegramClient, events
-from telethon.tl.types import Channel, Chat
+from telethon.errors import MessageNotModifiedError
+from telethon.tl.functions.bots import SetBotCommandsRequest
+from telethon.tl.types import BotCommand, BotCommandScopeDefault, Channel, Chat
 
 import config
 from links import fetch_link_messages, parse_links
@@ -13,6 +16,14 @@ from topics import GENERAL_TOPIC_ID, is_forum, list_topics
 from transfer import Reporter, has_file, transfer, transfer_zipped
 
 LOG_PATH = os.path.join(config.LOG_DIR, "bot.log")
+
+# Se muestran en el boton "Menu" de Telegram junto al campo de texto.
+BOT_COMMANDS = [
+    BotCommand("start", "Menú principal y ayuda"),
+    BotCommand("cola", "Ver la cola y cancelar envíos en espera"),
+    BotCommand("cancelar", "Vaciar la cola en armado"),
+    BotCommand("modo", "Alternar modo ZIP / separados (o /modo zip|separado)"),
+]
 
 
 def _log(line: str) -> None:
@@ -45,6 +56,18 @@ class Batch:
     zip_mode: bool = False
 
 
+@dataclass
+class Job:
+    """Lote con destino ya elegido: esperando turno o subiendose."""
+    id: int
+    batch: Batch
+    title: str
+    status_msg: object = None
+    running: bool = False
+    cancelled: bool = False
+    current: int = 0  # archivo que se esta subiendo (modo separado)
+
+
 class RateroBot:
     def __init__(self, bot: TelegramClient, user: TelegramClient):
         self.bot = bot
@@ -53,6 +76,10 @@ class RateroBot:
         self.batch = self._new_batch()
         self.process_lock = asyncio.Lock()
         self.dest_entities = {}
+        self.jobs: list[Job] = []
+        self.job_ids = itertools.count(1)
+        # Mensajes con enlaces que se estan resolviendo (aun no estan en la cola).
+        self.resolving = 0
 
     # ---------- modo de envio (separado / zip) ----------
 
@@ -101,19 +128,23 @@ class RateroBot:
             if not links:
                 await event.reply("No encontré archivos ni enlaces de mensajes (t.me/...) acá.")
                 return
-            for link in links:
-                try:
-                    found = await fetch_link_messages(self.user, link)
-                except Exception as e:
-                    errors.append(f"{link.url}: {e}")
-                    continue
-                files = [m for m in found if has_file(m)]
-                if not files:
-                    errors.append(f"{link.url}: no tiene archivo o no tengo acceso")
-                    continue
-                for m in files:
-                    label = m.file.name or ("foto" if m.photo else m.file.mime_type or "archivo")
-                    added += self._add(Item("user", m, label), ("user", m.chat_id, m.id))
+            self.resolving += 1
+            try:
+                for link in links:
+                    try:
+                        found = await fetch_link_messages(self.user, link)
+                    except Exception as e:
+                        errors.append(f"{link.url}: {e}")
+                        continue
+                    files = [m for m in found if has_file(m)]
+                    if not files:
+                        errors.append(f"{link.url}: no tiene archivo o no tengo acceso")
+                        continue
+                    for m in files:
+                        label = m.file.name or ("foto" if m.photo else m.file.mime_type or "archivo")
+                        added += self._add(Item("user", m, label), ("user", m.chat_id, m.id))
+            finally:
+                self.resolving -= 1
 
         if errors:
             await event.reply("No pude agregar:\n" + "\n".join(errors))
@@ -207,6 +238,14 @@ class RateroBot:
 
     async def on_callback(self, event):
         data = event.data.decode()
+        # Botones que no dependen del menu de destino activo.
+        if data.startswith("cj:"):
+            await self._cancel_job(event, int(data[3:]))
+            return
+        if data.startswith("cmd:"):
+            await self._run_menu_command(event, data[4:])
+            return
+
         batch = self.batch
         if event.message_id != getattr(batch.prompt_msg, "id", None):
             await event.answer("Este menú ya no está activo.")
@@ -264,13 +303,31 @@ class RateroBot:
         await event.edit(f"📤 {len(batch.items)} archivo(s) → {title}{mode}", buttons=None)
         # El tema General no admite reply_to: se publica sin tema.
         reply_to = None if topic_id in (None, GENERAL_TOPIC_ID) else topic_id
-        asyncio.create_task(self._process(batch, dest_id, title, reply_to))
+        job = Job(next(self.job_ids), batch, title)
+        job.status_msg = await self.bot.send_message(
+            config.OWNER_ID, f"⏳ En espera: {len(batch.items)} archivo(s) → {title}",
+            buttons=[[Button.inline("❌ Cancelar este envío", f"cj:{job.id}".encode())]])
+        # Se registra ya (no dentro de la tarea) para que /cola lo vea de inmediato.
+        self.jobs.append(job)
+        asyncio.create_task(self._process(job, dest_id, reply_to))
 
     # ---------- procesamiento ----------
 
-    async def _process(self, batch: Batch, dest_id: int, title: str, topic_id=None):
-        status = await self.bot.send_message(config.OWNER_ID, "⏳ En espera…")
+    async def _process(self, job: Job, dest_id: int, topic_id=None):
+        try:
+            await self._process_job(job, dest_id, topic_id)
+        finally:
+            if job in self.jobs:
+                self.jobs.remove(job)
+
+    async def _process_job(self, job: Job, dest_id: int, topic_id=None):
+        batch, title, status = job.batch, job.title, job.status_msg
         async with self.process_lock:
+            if job.cancelled:
+                return
+            job.running = True
+            # Ya no se puede cancelar: se quita el boton.
+            await status.edit(f"📤 {title}\niniciando…", buttons=None)
             dest = self.dest_entities.get(dest_id) or await self.user.get_entity(dest_id)
             total = len(batch.items)
             if batch.zip_mode and total > 1:
@@ -279,6 +336,7 @@ class RateroBot:
             ok, failed = 0, []
             _log(f"INICIO {total} archivo(s) -> {title} ({dest_id})")
             for i, item in enumerate(batch.items, 1):
+                job.current = i
                 reporter = Reporter(status, f"📤 {title} — {i}/{total}: {item.label}")
                 await reporter.set("iniciando…", force=True)
                 dl_client = self.bot if item.source == "bot" else self.user
@@ -310,21 +368,89 @@ class RateroBot:
             summary += "\n\n❌ Fallaron:\n" + "\n".join(failed)
         await status.edit(summary)
 
+    # ---------- cancelar envios en espera ----------
+
+    def _queue_view(self):
+        """Texto y botones de /cola para los lotes con destino ya elegido, o
+        (None, None) si no hay ninguno."""
+        lines, buttons = [], []
+        for job in self.jobs:
+            n = len(job.batch.items)
+            if job.running:
+                prog = f" {job.current}/{n}" if job.current else ""
+                lines.append(f"📤 Subiendo{prog}: {n} archivo(s) → {job.title}")
+            else:
+                lines.append(f"⏳ En espera: {n} archivo(s) → {job.title}")
+                buttons.append([Button.inline(f"❌ Cancelar → {job.title}"[:60], f"cj:{job.id}".encode())])
+        if self.resolving:
+            lines.append(f"🔎 Resolviendo {self.resolving} mensaje(s) con enlaces…")
+        if not lines:
+            return None, None
+        return "\n".join(lines), buttons or None
+
+    async def _cancel_job(self, event, job_id: int):
+        job = next((j for j in self.jobs if j.id == job_id), None)
+        if job is None:
+            await event.answer("Ese envío ya terminó o fue cancelado.")
+        elif job.running:
+            await event.answer("Ese envío ya se está subiendo; no se puede cancelar.", alert=True)
+        else:
+            job.cancelled = True
+            self.jobs.remove(job)
+            _log(f"CANCELADO {len(job.batch.items)} archivo(s) -> {job.title}")
+            await event.answer("Envío cancelado")
+            try:
+                await job.status_msg.edit(
+                    f"🚫 Cancelado: {len(job.batch.items)} archivo(s) → {job.title}", buttons=None)
+            except MessageNotModifiedError:
+                pass
+        # Si se toco desde el listado de /cola, se refresca ese listado.
+        if job is None or event.message_id != job.status_msg.id:
+            text, buttons = self._queue_view()
+            try:
+                await event.edit(text or "No hay envíos pendientes.", buttons=buttons)
+            except MessageNotModifiedError:
+                pass
+
     # ---------- comandos ----------
 
-    async def on_start(self, event):
-        await event.respond(
+    def _help_text(self) -> str:
+        return (
             "Reenviame archivos (fotos, videos, documentos…) o pegame enlaces "
             "de mensajes t.me/... — uno o varios. Cuando dejes de mandar, te "
             "pregunto a qué grupo subirlos y van todos al mismo.\n\n"
-            "/cola — ver lo que hay en cola\n"
-            "/cancelar — vaciar la cola\n"
-            "/modo [zip|separado] — cómo enviar varios archivos juntos "
-            f"(ahora: {self._mode_label(self.zip_default)})"
+            "/cola — ver la cola y cancelar envíos en espera\n"
+            "/cancelar — vaciar la cola en armado\n"
+            "/modo [zip|separado] — cómo enviar varios archivos juntos\n\n"
+            f"Modo actual: {self._mode_label(self.zip_default)}"
         )
 
-    async def on_mode(self, event):
-        arg = (event.pattern_match.group(1) or "").strip().lower()
+    def _menu_buttons(self):
+        other = "📄 separados" if self.zip_default else "🗜️ ZIP"
+        return [
+            [Button.inline("📋 Ver cola", b"cmd:cola"), Button.inline("🗑️ Vaciar cola", b"cmd:cancelar")],
+            [Button.inline(f"🔀 Cambiar modo a {other}", b"cmd:modo")],
+        ]
+
+    async def _run_menu_command(self, event, name: str):
+        if name == "cola":
+            await event.answer()
+            await self.on_queue(event)
+        elif name == "cancelar":
+            await event.answer()
+            await self.on_cancel(event)
+        elif name == "modo":
+            await event.answer(self._set_mode(""))
+            await event.edit(self._help_text(), buttons=self._menu_buttons())
+        else:
+            await event.answer("Opción desconocida.")
+
+    async def on_start(self, event):
+        await event.respond(self._help_text(), buttons=self._menu_buttons())
+
+    def _set_mode(self, arg: str) -> str | None:
+        """Cambia el modo global ('' alterna). Devuelve el texto de
+        confirmacion, o None si el argumento no es valido."""
         if arg in ("zip", "comprimido"):
             self.zip_default = True
         elif arg in ("separado", "separados"):
@@ -332,20 +458,28 @@ class RateroBot:
         elif not arg:
             self.zip_default = not self.zip_default
         else:
-            await event.respond("Uso: /modo zip | /modo separado (sin argumento alterna)")
-            return
+            return None
         self._save_zip_default()
-        await event.respond(f"Modo por defecto para varios archivos: {self._mode_label(self.zip_default)}")
         # La cola en armado adopta el nuevo modo y se refresca su menu.
         if self.batch.items:
             self.batch.zip_mode = self.zip_default
             self._schedule_prompt()
+        return f"Modo por defecto para varios archivos: {self._mode_label(self.zip_default)}"
+
+    async def on_mode(self, event):
+        text = self._set_mode((event.pattern_match.group(1) or "").strip().lower())
+        await event.respond(text or "Uso: /modo zip | /modo separado (sin argumento alterna)")
 
     async def on_queue(self, event):
-        if not self.batch.items:
+        # Lotes que ya tienen destino: el que se esta subiendo y los que esperan turno.
+        text, buttons = self._queue_view()
+        if text:
+            await event.respond(text, buttons=buttons)
+        if self.batch.items:
+            # El lote en armado (sin destino aun) se muestra con su menu.
+            self._schedule_prompt()
+        elif not text:
             await event.respond("La cola está vacía.")
-            return
-        self._schedule_prompt()
 
     async def on_cancel(self, event):
         n = len(self.batch.items)
@@ -390,6 +524,11 @@ async def main() -> None:
     if not await user.is_user_authorized():
         raise RuntimeError("La sesion de usuario no esta autorizada: corre `python login.py`")
     await bot.start(bot_token=config.BOT_TOKEN)
+
+    try:
+        await bot(SetBotCommandsRequest(scope=BotCommandScopeDefault(), lang_code="", commands=BOT_COMMANDS))
+    except Exception as e:
+        _log(f"No pude registrar el menu de comandos: {e!r}")
 
     try:
         RateroBot(bot, user).register()
