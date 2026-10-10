@@ -13,6 +13,7 @@ from telethon import errors
 from telethon.tl.types import MessageMediaWebPage
 
 import config
+from album_name import guess_album_name
 from fast_download import download_document_fast
 from fast_upload import upload_file_fast
 
@@ -345,7 +346,8 @@ async def transfer_zipped(entries, up_client, dest, status_msg, title, topic_id=
     """Modo ZIP: descarga todos los mensajes de `entries` [(dl_client, msg,
     label)], sube un ZIP con todos los archivos (partido si excede
     `zip_max_bytes`) y ademas publica las imagenes como album. `base_name` es
-    el nombre del ZIP sin extension (default archivos_<fecha>).
+    el nombre del ZIP sin extension; si es None se intenta deducir del
+    album ("Artista - Album (Año)") y si no, archivos_<fecha>.
     Devuelve (resumen, lista de fallos, indices de `entries` a reintentar)."""
     # Originales + ZIP: hace falta mas o menos el doble del lote.
     ensure_disk_space(2 * sum(file_size(msg) for _, msg, _ in entries))
@@ -377,6 +379,9 @@ async def transfer_zipped(entries, up_client, dest, status_msg, title, topic_id=
 
         reporter = Reporter(status_msg, f"🗜️ {title}", buttons)
         await reporter.set(f"comprimiendo {len(downloaded)} archivo(s)…", force=True)
+        if not base_name:
+            base_name = await asyncio.to_thread(
+                guess_album_name, [p for _, p in downloaded], [m.message for m, _ in downloaded])
         base_name = base_name or "archivos_" + datetime.now().strftime("%Y%m%d_%H%M%S")
         zips = await asyncio.to_thread(build_zips, [p for _, p in downloaded], work_dir,
                                        base_name, zip_max_bytes)

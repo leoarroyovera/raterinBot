@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -12,6 +11,7 @@ from telethon.tl.functions.bots import SetBotCommandsRequest
 from telethon.tl.types import BotCommand, BotCommandScopeDefault, Channel, Chat
 
 import config
+from album_name import clean_name
 from links import fetch_link_messages, parse_links
 from topics import GENERAL_TOPIC_ID, is_forum, list_topics
 from transfer import MIB, Board, file_size, has_file, human, prepare, publish, transfer_zipped
@@ -35,13 +35,6 @@ def _log(line: str) -> None:
     with open(LOG_PATH, "a", encoding="utf-8") as f:
         f.write(f"[{stamp}] {line}\n")
     print(line)
-
-
-def _clean_zip_name(text: str) -> str:
-    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", text).strip()
-    if name.lower().endswith(".zip"):
-        name = name[:-4]
-    return name.strip(" .")[:100]
 
 
 @dataclass
@@ -359,10 +352,10 @@ class RateroBot:
 
     async def _set_zip_name(self, event, text: str):
         self.batch.awaiting_name = False
-        name = _clean_zip_name(text)
+        name = clean_name(text)
         self.batch.zip_name = None if name in ("", "-") else name
         self._save_queue()
-        shown = f"{self.batch.zip_name}.zip" if self.batch.zip_name else "automático (archivos_<fecha>.zip)"
+        shown = f"{self.batch.zip_name}.zip" if self.batch.zip_name else "automático"
         await event.reply(f"✏️ Nombre del ZIP: {shown}")
         if self.batch.items:
             self._schedule_prompt()
@@ -401,7 +394,7 @@ class RateroBot:
         if len(batch.items) > 1:
             lines.append(f"\nModo: {self._mode_label(batch.zip_mode)}")
             if batch.zip_mode:
-                lines.append(f"Nombre: {batch.zip_name or 'archivos_<fecha>'}.zip")
+                lines.append(f"Nombre: {batch.zip_name + '.zip' if batch.zip_name else 'automático (del álbum si se detecta)'}")
         lines.append(f"\n{question}")
         return "\n".join(lines)
 

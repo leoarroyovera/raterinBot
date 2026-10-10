@@ -29,7 +29,7 @@ Bot de Telegram al que le reenviás archivos (fotos, videos, documentos, audio�
    - enlaces de mensajes: `t.me/canal/123`, `t.me/c/1234567/123`, con topic (`t.me/c/1234567/5/123`). Se pueden pegar varios en un mismo mensaje.
    - rangos de mensajes: `t.me/canal/100-150` trae todos los mensajes con archivo entre el 100 y el 150 (máximo 500 por rango). En un enlace con topic el rango es por id de mensaje, así que puede incluir mensajes de otros temas.
 2. Cuando pasan ~2,5 s sin que mandes nada nuevo, el bot te muestra la cola con botones para elegir el grupo destino (paginados, con los últimos usados primero, marcados con 🕘). Si seguís mandando cosas, el menú se actualiza.
-3. Antes de elegir, con más de un archivo podés tocar **✂️ Quitar archivos** para sacar algunos de la cola, y en modo ZIP **✏️ Nombre del ZIP** para ponerle nombre (mandá «-» para volver al automático).
+3. Antes de elegir, con más de un archivo podés tocar **✂️ Quitar archivos** para sacar algunos de la cola, y en modo ZIP **✏️ Nombre del ZIP** para ponerle nombre (mandá «-» para volver al automático). El nombre automático intenta ser `Artista - Álbum (Año)`: primero con las etiquetas de los archivos de audio (álbum, artista del álbum o artista, fecha; si cada tema tiene otro artista queda "Varios artistas"), después con un caption que tenga esa forma y por último con los nombres de archivo. Si no se puede deducir, queda `archivos_<fecha>.zip`.
 4. Tocás el grupo (y el tema, si es un supergrupo con Temas) y el bot sube todo ahí, en orden, mostrando el progreso. Al final te dice cuántos subió y cuáles fallaron.
 
 Comandos (también disponibles en el botón **Menú** de Telegram y como botones en `/start`):
