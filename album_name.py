@@ -52,6 +52,19 @@ def _tag(tags, key):
     return str(value).strip() if value else None
 
 
+# WAV y AIFF guardan ID3, pero mutagen.File(easy=True) no lo traduce a las
+# claves "album", "artist"… como hace con MP3: se mapean los frames a mano.
+ID3_FRAMES = {"artist": "TPE1", "albumartist": "TPE2", "album": "TALB",
+              "date": "TDRC", "originaldate": "TDOR"}
+
+
+def _easy_tags(tags):
+    if hasattr(tags, "getall") and not hasattr(tags, "valid_keys"):
+        return {key: [str(x) for f in tags.getall(frame) for x in f.text]
+                for key, frame in ID3_FRAMES.items() if tags.getall(frame)}
+    return tags
+
+
 def from_tags(paths) -> str | None:
     if mutagen is None:
         return None
@@ -63,10 +76,11 @@ def from_tags(paths) -> str | None:
             continue
         if audio is None or not audio.tags:
             continue
-        albums.append(_tag(audio.tags, "album"))
-        artists.append(_tag(audio.tags, "artist"))
-        album_artists.append(_tag(audio.tags, "albumartist"))
-        date = _tag(audio.tags, "date") or _tag(audio.tags, "originaldate") or ""
+        tags = _easy_tags(audio.tags)
+        albums.append(_tag(tags, "album"))
+        artists.append(_tag(tags, "artist"))
+        album_artists.append(_tag(tags, "albumartist"))
+        date = _tag(tags, "date") or _tag(tags, "originaldate") or ""
         m = YEAR_RE.search(date)
         years.append(m.group(0) if m else None)
 
